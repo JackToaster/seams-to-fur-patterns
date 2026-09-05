@@ -13,6 +13,7 @@ import sys
 import traceback
 
 import bpy
+import mathutils
 
 ADDON_MODULE = "bl_ext.user_default.usbee"
 
@@ -345,6 +346,99 @@ def test_svg_export():
     assert svg_text.startswith("<svg")
     assert svg_text.strip().endswith("</svg>")
     assert svg_text.count("<polygon") == 1  # one piece, no offset -> no cut-line
+
+
+@test("material thickness shells the surface outward before cutting, growing the flattened piece")
+def test_material_thickness_offset():
+    _clean_scene()
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=16, ring_count=8)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Sphere"
+
+    face = mesh_obj.data.polygons[0]
+    world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
+    centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
+    _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.6 for p in world_pts])
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    mesh_obj.usbee_thickness_mm = 0.0
+    assert bpy.ops.usbee.flatten_all() == {"FINISHED"}
+    base_dims = bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object].dimensions.copy()
+
+    mesh_obj.usbee_thickness_mm = 200.0  # a large, easy-to-detect shell on a 1m-radius sphere
+    assert bpy.ops.usbee.flatten_all() == {"FINISHED"}
+    thick_dims = bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object].dimensions
+
+    assert thick_dims.x > base_dims.x and thick_dims.y > base_dims.y, (
+        f"expected the piece to grow with material thickness "
+        f"(base={tuple(base_dims)}, thick={tuple(thick_dims)})"
+    )
+
+
+@test("ORIGIN placement mode centers each flattened piece at its curved piece's 3D position")
+def test_origin_placement_mode():
+    _clean_scene()
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(5.0, 0.0, 0.0))
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Cube"
+    mesh_obj.usbee_placement_mode = "ORIGIN"
+
+    # A closed cube has no boundary at all (same reason the sphere needs one
+    # in the other tests) - cut off one face so there's something to flatten.
+    face = next(f for f in mesh_obj.data.polygons if tuple(f.normal) == (0.0, 0.0, 1.0))
+    world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
+    centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
+    _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.8 for p in world_pts])
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    assert bpy.ops.usbee.flatten_all() == {"FINISHED"}
+
+    small_piece = min(
+        mesh_obj.usbee_pieces,
+        key=lambda p: len(bpy.data.objects[p.flattened_object].data.polygons),
+    )
+    piece = small_piece
+    flat_obj = bpy.data.objects[piece.flattened_object]
+    expected_world = mesh_obj.matrix_world @ mathutils.Vector(piece.sample_point)
+    assert (flat_obj.location - expected_world).length < 1e-6, (
+        f"expected flat piece at {tuple(expected_world)}, got {tuple(flat_obj.location)}"
+    )
+    # The cube is centered at world (5,0,0) with faces ~0.5 away from center,
+    # so any single face's centroid-based placement should land near there,
+    # not at the world origin (which GRID mode would effectively do).
+    assert flat_obj.location.length > 1.0
+
+
+@test("distortion preview builds one colored object per piece at the source mesh's position")
+def test_distortion_preview():
+    _clean_scene()
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=12, ring_count=6, location=(3.0, 0.0, 0.0))
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Sphere"
+
+    face = mesh_obj.data.polygons[0]
+    world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
+    centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
+    _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.6 for p in world_pts])
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    result = bpy.ops.usbee.show_distortion_preview()
+    assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
+
+    from bl_ext.user_default.usbee.operators import distortion as distortion_ops
+
+    coll = bpy.data.collections.get(f"{distortion_ops.DISTORTION_COLLECTION_PREFIX}Sphere")
+    assert coll is not None, "expected a distortion preview collection"
+    assert len(coll.objects) == len(mesh_obj.usbee_pieces)
+
+    obj = coll.objects[0]
+    assert (obj.matrix_world.translation - mesh_obj.matrix_world.translation).length < 1e-6, (
+        "distortion preview piece should sit at the source mesh's position, not the flattened layout"
+    )
+    assert distortion_ops.DISTORTION_ATTR in obj.data.attributes
+
+    assert bpy.ops.usbee.hide_distortion_preview() == {"FINISHED"}
+    assert bpy.data.collections.get(f"{distortion_ops.DISTORTION_COLLECTION_PREFIX}Sphere") is None
 
 
 def run_all():

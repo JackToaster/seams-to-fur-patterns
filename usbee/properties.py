@@ -10,6 +10,7 @@ import bpy
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
+    EnumProperty,
     FloatProperty,
     FloatVectorProperty,
     IntProperty,
@@ -96,7 +97,16 @@ class UsbeePieceSettings(PropertyGroup):
         size=3,
     )
 
-    # --- Reserved for Phase 2, unused in Phase 1 ---
+    # --- Phase 2 ---
+    def _update_color(self, context):
+        # Cheap live feedback only (flattened object's viewport color) so
+        # dragging the color picker stays responsive; the full per-piece
+        # material rebuild on the source mesh is explicit (usbee.sync_piece_colors)
+        # since it's too heavy to run on every color-drag tick.
+        flat_obj = bpy.data.objects.get(self.flattened_object) if self.flattened_object else None
+        if flat_obj is not None:
+            flat_obj.color = self.color
+
     color: FloatVectorProperty(
         name="Color",
         subtype="COLOR",
@@ -104,6 +114,7 @@ class UsbeePieceSettings(PropertyGroup):
         min=0.0,
         max=1.0,
         default=(0.8, 0.8, 0.8, 1.0),
+        update=_update_color,
     )
     grain_direction: FloatVectorProperty(
         name="Grain Direction",
@@ -128,9 +139,36 @@ def register():
 
     bpy.types.Object.usbee_pieces = CollectionProperty(type=UsbeePieceSettings)
     bpy.types.Object.usbee_active_piece_index = IntProperty(default=0)
+    bpy.types.Object.usbee_thickness_mm = FloatProperty(
+        name="Material Thickness (mm)",
+        description=(
+            "Shells the surface outward along its normals by half this "
+            "amount before cutting, so the flattened pattern accounts for "
+            "material thickness (e.g. foam) rather than just the base "
+            "mesh surface"
+        ),
+        default=0.0,
+        min=0.0,
+        soft_max=20.0,
+    )
+    bpy.types.Object.usbee_placement_mode = EnumProperty(
+        name="Placement",
+        description="Where newly-flattened pieces are placed",
+        items=[
+            ("GRID", "Grid Layout", "Non-overlapping grid, for exporting/printing"),
+            (
+                "ORIGIN",
+                "At Original Position",
+                "Each piece's center placed where its curved piece's center was in 3D",
+            ),
+        ],
+        default="GRID",
+    )
 
 
 def unregister():
+    del bpy.types.Object.usbee_placement_mode
+    del bpy.types.Object.usbee_thickness_mm
     del bpy.types.Object.usbee_active_piece_index
     del bpy.types.Object.usbee_pieces
 

@@ -3,6 +3,7 @@ import math
 import bmesh
 import bpy
 from bpy.types import Operator
+from mathutils import Vector
 
 from ..backends import bff
 from ..geometry import boundary, islands, layout, polygon_offset
@@ -61,15 +62,20 @@ def _pattern_collection(context, mesh_obj):
 
 
 def _build_or_update_flat_object(context, mesh_obj, piece, verts2d, faces, grid_offset_xy):
-    """Creates the flat object on first bake (applying the automatic
-    shelf-layout offset so it doesn't overlap other pieces). On re-bake of
-    an existing object, the shape is updated in place without re-applying
-    the grid offset - this is what makes a manual reposition survive a
-    re-bake, without needing depsgraph-based move detection."""
+    """Creates the flat object on first bake, placed per
+    mesh_obj.usbee_placement_mode ('GRID': automatic shelf layout so pieces
+    don't overlap, for exporting/printing; 'ORIGIN': the piece's own center
+    placed at the world-space position its curved piece's center occupied
+    in 3D, for an "exploded view" comparison against the model). On re-bake
+    of an existing object, the shape is updated in place without
+    re-applying placement - this is what makes a manual reposition survive
+    a re-bake, without needing depsgraph-based move detection."""
     pattern_coll = _pattern_collection(context, mesh_obj)
 
     flat_mesh_name = f"{mesh_obj.name}.{piece.name}"
     existing_obj = bpy.data.objects.get(piece.flattened_object) if piece.flattened_object else None
+
+    placement_mode = getattr(mesh_obj, "usbee_placement_mode", "GRID")
 
     if existing_obj is not None and existing_obj.type == "MESH":
         placed = [(x, y, 0.0) for (x, y, _z) in verts2d]
@@ -77,11 +83,18 @@ def _build_or_update_flat_object(context, mesh_obj, piece, verts2d, faces, grid_
         flat_mesh.clear_geometry()
         flat_obj = existing_obj
     else:
-        ox, oy = grid_offset_xy
-        placed = [(x + ox, y + oy, 0.0) for (x, y, _z) in verts2d]
         flat_mesh = bpy.data.meshes.new(flat_mesh_name)
         flat_obj = bpy.data.objects.new(flat_mesh_name, flat_mesh)
         pattern_coll.objects.link(flat_obj)
+
+        if placement_mode == "ORIGIN":
+            cx = sum(x for x, _y, _z in verts2d) / len(verts2d)
+            cy = sum(y for _x, y, _z in verts2d) / len(verts2d)
+            placed = [(x - cx, y - cy, 0.0) for (x, y, _z) in verts2d]
+            flat_obj.location = mesh_obj.matrix_world @ Vector(piece.sample_point)
+        else:
+            ox, oy = grid_offset_xy
+            placed = [(x + ox, y + oy, 0.0) for (x, y, _z) in verts2d]
 
     flat_mesh.from_pydata(placed, [], faces)
     flat_mesh.update()
@@ -133,7 +146,10 @@ def _update_cut_line(context, mesh_obj, piece, flat_obj, boundary_loop_2d):
 def _evaluated_bmesh(context, mesh_obj):
     """Builds a BMesh from the object's fully evaluated (post-modifier)
     mesh, so e.g. a Subdivision Surface modifier's smoothed result gets
-    flattened rather than the low-poly base cage."""
+    flattened rather than the low-poly base cage. If usbee_thickness_mm is
+    set, the surface is shelled outward along its normals by that amount
+    first, so the flattened pattern accounts for material thickness (e.g.
+    foam) instead of just the bare mesh surface."""
     depsgraph = context.evaluated_depsgraph_get()
     eval_obj = mesh_obj.evaluated_get(depsgraph)
     eval_mesh = eval_obj.to_mesh()
@@ -144,6 +160,15 @@ def _evaluated_bmesh(context, mesh_obj):
     bm.faces.ensure_lookup_table()
 
     eval_obj.to_mesh_clear()
+
+    thickness_mm = getattr(mesh_obj, "usbee_thickness_mm", 0.0)
+    if thickness_mm:
+        scale_length = context.scene.unit_settings.scale_length or 1.0
+        thickness_units = (thickness_mm / 1000.0) / scale_length
+        bm.normal_update()
+        for v in bm.verts:
+            v.co += v.normal * thickness_units
+
     return bm
 
 

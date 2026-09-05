@@ -13,6 +13,7 @@ class USBEE_UL_pieces(UIList):
         elif item.flatten_dirty:
             row.label(text="", icon="FILE_REFRESH")
         row.prop(item, "offset_mm", text="")
+        row.prop(item, "color", text="")
 
 
 class USBEE_PT_main(Panel):
@@ -49,6 +50,13 @@ class USBEE_PT_main(Panel):
         layout.operator("usbee.draw_seam_curve", icon="GREASEPENCIL", text="Draw Seam Curve")
         layout.operator("usbee.add_seam_curve", icon="CURVE_DATA", text="Add Blank Seam Curve")
 
+        settings_box = layout.box()
+        settings_box.prop(obj, "usbee_thickness_mm")
+        settings_box.prop(obj, "usbee_placement_mode")
+        distort_row = settings_box.row(align=True)
+        distort_row.operator("usbee.show_distortion_preview", icon="SHADING_RENDERED")
+        distort_row.operator("usbee.hide_distortion_preview", icon="X", text="")
+
         col = layout.column()
         col.label(text="Pieces:")
         col.template_list(
@@ -81,9 +89,41 @@ class USBEE_PT_main(Panel):
         layout.operator("usbee.export_svg", icon="EXPORT")
 
 
+class USBEE_PT_appearance(Panel):
+    bl_label = "Appearance (Color / Fur)"
+    bl_idname = "USBEE_PT_appearance"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "USBee"
+    bl_parent_id = "USBEE_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "MESH"
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+
+        layout.operator("usbee.sync_piece_colors", icon="MATERIAL")
+        layout.operator("usbee.set_grain_direction", icon="EMPTY_SINGLE_ARROW")
+
+        if 0 <= obj.usbee_active_piece_index < len(obj.usbee_pieces):
+            active_piece = obj.usbee_pieces[obj.usbee_active_piece_index]
+            layout.prop(active_piece, "grain_direction", text="Grain Dir.")
+
+        layout.separator()
+        fur_box = layout.box()
+        fur_box.label(text="Fur / Hair Preview", icon="OUTLINER_OB_HAIR")
+        fur_box.operator("usbee.apply_fur_preview", icon="PARTICLES")
+
+
 _classes = (
     USBEE_UL_pieces,
     USBEE_PT_main,
+    USBEE_PT_appearance,
 )
 
 

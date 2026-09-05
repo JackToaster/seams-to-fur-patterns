@@ -2,7 +2,7 @@ from . import (
     preferences,
     properties,
 )
-from .operators import export_svg, flatten, seam_curve
+from .operators import appearance, distortion, export_svg, flatten, seam_curve
 from .ui import operators_menu, panels
 
 _modules = (
@@ -10,6 +10,8 @@ _modules = (
     preferences,
     seam_curve,
     flatten,
+    distortion,
+    appearance,
     export_svg,
     panels,
     operators_menu,
