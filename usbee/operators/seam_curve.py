@@ -440,11 +440,30 @@ _classes = (
 )
 
 
+def _fix_modifier_order_handler(_scene, _depsgraph):
+    # Keeps "USBee Surface Follow" pinned to the end of each seam curve's
+    # modifier stack continuously, not just when this addon creates it -
+    # Blender always appends a modifier the user adds via the UI (e.g.
+    # Mirror, to mirror the seam itself) to the end, which would otherwise
+    # land *after* ours and end up mirroring the generated tube mesh
+    # instead of the original curve. See curve_display.ensure_modifier_last.
+    coll = bpy.data.collections.get(SEAM_CURVE_COLLECTION)
+    if coll is None:
+        return
+    for obj in coll.objects:
+        if obj.type == "CURVE":
+            curve_display.ensure_modifier_last(obj)
+
+
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
+    if _fix_modifier_order_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_fix_modifier_order_handler)
 
 
 def unregister():
+    if _fix_modifier_order_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_fix_modifier_order_handler)
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

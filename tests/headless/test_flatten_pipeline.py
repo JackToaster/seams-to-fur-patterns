@@ -369,6 +369,47 @@ def test_seam_curve_mirror_bias_no_zigzag():
     )
 
 
+@test("a Mirror modifier added after curve creation gets pushed before the display tube, not after")
+def test_modifier_order_self_heals():
+    _clean_scene()
+    bpy.ops.mesh.primitive_plane_add(size=2.0)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Plane"
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.usbee.add_seam_curve()
+    curve_obj = bpy.context.active_object
+
+    from bl_ext.user_default.usbee.geometry import curve_display
+
+    assert [m.name for m in curve_obj.modifiers] == [curve_display.MODIFIER_NAME], (
+        "expected only the display modifier right after creation"
+    )
+
+    # Simulate the user adding their own Mirror modifier via Blender's UI,
+    # which always appends to the end - landing *after* our display
+    # modifier, i.e. in the wrong place, exactly like the reported bug
+    # (Mirror ends up mirroring the generated tube mesh, not the curve).
+    curve_obj.modifiers.new(name="Mirror", type="MIRROR")
+    assert [m.name for m in curve_obj.modifiers] == [curve_display.MODIFIER_NAME, "Mirror"], (
+        "test setup assumption broken: Blender didn't append Mirror to the end"
+    )
+
+    # This is what the depsgraph handler calls on every update to
+    # self-heal the order without needing a hook into the user's own
+    # modifier-stack edits.
+    curve_display.ensure_modifier_last(curve_obj)
+    assert curve_obj.modifiers[-1].name == curve_display.MODIFIER_NAME, (
+        "ensure_modifier_last should have pushed the display modifier back to the end"
+    )
+
+    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+
+    assert seam_curve_ops._fix_modifier_order_handler in bpy.app.handlers.depsgraph_update_post, (
+        "expected the self-healing handler to be registered while the addon is enabled"
+    )
+
+
 @test("a new seam curve can snap to segments of an already-drawn one on the same mesh")
 def test_snap_to_other_seam_curve_segments():
     _clean_scene()

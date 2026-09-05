@@ -122,18 +122,31 @@ def add_or_update_modifier(curve_obj, mesh_obj, segment_length, bias_local=(0.0,
     mod[socket_id_for(ng, "Tube Radius")] = TUBE_RADIUS
     mod[socket_id_for(ng, "Bias")] = tuple(bias_local)
 
-    # Modifiers a user adds afterward (Array/Mirror to repeat the cut
-    # pattern) need to run *before* this one, so each duplicate gets
-    # independently resampled and projected onto its own patch of surface -
-    # otherwise Array would just rigid-copy the first copy's already-glued
-    # shape. Keep this modifier pinned last on every call, since we have no
-    # hook into modifiers the user adds through Blender's own UI.
+    ensure_modifier_last(curve_obj)
+    return mod
+
+
+def ensure_modifier_last(curve_obj):
+    """Modifiers a user adds afterward (Array/Mirror to repeat the cut
+    pattern, or to mirror the seam itself) need to run *before* this one,
+    so each duplicate gets independently resampled and projected onto its
+    own patch of surface - otherwise Array/Mirror would just rigid-copy (or
+    mirror) the first copy's already-glued *tube mesh* instead of the
+    original curve, which looks like "Mirror turns my curve into a mesh".
+
+    Blender always appends newly-added modifiers to the end of the stack,
+    so a Mirror the user adds via the UI *after* this one already exists
+    lands in the wrong place with no hook to catch it at add-time - this
+    must be re-checked continuously (see the depsgraph handler in
+    operators.seam_curve), not just once when this modifier is created.
+    """
+    mod = curve_obj.modifiers.get(MODIFIER_NAME)
+    if mod is None:
+        return
     last_index = len(curve_obj.modifiers) - 1
     current_index = list(curve_obj.modifiers).index(mod)
     if current_index != last_index:
         curve_obj.modifiers.move(current_index, last_index)
-
-    return mod
 
 
 def set_modifier_enabled(curve_obj, enabled):
