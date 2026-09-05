@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.blend1
+
+# Machine-specific dev build of the BFF CLI backend (dynamically linked
+# against this machine's system SuiteSparse) - see README for how to build
+# it locally. Not a redistributable binary, so it doesn't belong in git.
+usbee/backends/bin/*/bff-command-line
+usbee/backends/bin/*/bff-command-line.exe
