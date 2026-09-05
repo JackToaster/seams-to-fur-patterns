@@ -164,18 +164,12 @@ def _flatten_pieces(context, mesh_obj, piece_ids):
             errors.append(f"Piece '{piece.name}': {exc}")
             continue
 
-        local_verts = {}
-        verts_list = []
-        faces_local = []
-        for f_idx in island_face_indices:
-            face = bm.faces[f_idx]
-            local_face = []
-            for v in face.verts:
-                if v.index not in local_verts:
-                    local_verts[v.index] = len(verts_list)
-                    verts_list.append(tuple(v.co))
-                local_face.append(local_verts[v.index])
-            faces_local.append(local_face)
+        # Duplicates vertices along any seam edges internal to this island
+        # (e.g. a dart cut) so the cut can actually open up when flattened,
+        # rather than BFF seeing a fully-connected mesh with no cut at all.
+        verts_list, faces_local = islands.split_island_for_flatten(
+            bm, island_face_indices, seam_edges
+        )
 
         try:
             out_verts, out_faces = bff.flatten_island(binary_path, verts_list, faces_local)

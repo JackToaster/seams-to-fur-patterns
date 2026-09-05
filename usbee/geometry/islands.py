@@ -190,6 +190,75 @@ def isolate_islands(bm, seam_edge_indices):
     return face_island, island_id
 
 
+def split_island_for_flatten(bm, island_face_indices, seam_edge_indices):
+    """Build the vertex/face lists to send to the flattening backend for one
+    island, duplicating vertices along any seam edges that are *internal* to
+    the island (e.g. a dart/slit cut that doesn't fully separate it into two
+    islands) so the two sides of the cut can actually open up into a gap
+    when flattened, instead of BFF seeing a fully-connected mesh and folding
+    the "cut" shut.
+
+    Boundary-of-island seam edges (where the seam separates this island from
+    a *different* island) don't need special handling here - they're already
+    single-sided since only this island's faces are included - but passing
+    the full resolved seam edge set is harmless for those too: the
+    wedge-grouping below degenerates to a single wedge whenever a vertex's
+    other seam-adjacent faces simply aren't part of this island.
+    """
+    seam_set = set(seam_edge_indices)
+    island_face_set = set(island_face_indices)
+
+    vert_faces = {}
+    for f_idx in island_face_indices:
+        face = bm.faces[f_idx]
+        for v in face.verts:
+            vert_faces.setdefault(v.index, []).append(face)
+
+    # (vert_index, face_index) -> wedge id, grouping a vertex's incident
+    # island faces via face-adjacency that doesn't cross a seam edge at
+    # that vertex - the same barrier-flood-fill idea as isolate_islands,
+    # just scoped to one vertex's face fan instead of the whole mesh.
+    wedge_of = {}
+    for v_idx, faces in vert_faces.items():
+        visited = {}
+        next_wedge = 0
+        for f in faces:
+            if f.index in visited:
+                continue
+            stack = [f]
+            visited[f.index] = next_wedge
+            while stack:
+                cur = stack.pop()
+                for e in cur.edges:
+                    if v_idx not in (e.verts[0].index, e.verts[1].index):
+                        continue
+                    if e.index in seam_set:
+                        continue
+                    for nf in e.link_faces:
+                        if nf.index in island_face_set and nf.index not in visited:
+                            visited[nf.index] = next_wedge
+                            stack.append(nf)
+            next_wedge += 1
+        for f_idx2, wid in visited.items():
+            wedge_of[(v_idx, f_idx2)] = wid
+
+    local_index = {}
+    verts_list = []
+    faces_local = []
+    for f_idx in island_face_indices:
+        face = bm.faces[f_idx]
+        local_face = []
+        for v in face.verts:
+            key = (v.index, wedge_of[(v.index, f_idx)])
+            if key not in local_index:
+                local_index[key] = len(verts_list)
+                verts_list.append(tuple(v.co))
+            local_face.append(local_index[key])
+        faces_local.append(local_face)
+
+    return verts_list, faces_local
+
+
 def validate_island_topology(bm, face_indices):
     """Check that the given faces form a single disk (genus-0, one boundary
     loop, manifold). Raises TopologyError with a human-readable reason if

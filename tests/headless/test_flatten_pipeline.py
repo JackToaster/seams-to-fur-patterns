@@ -225,6 +225,43 @@ def test_partial_rebake_only_touches_edited_piece():
     )
 
 
+@test("open (dart) seam curve stays one piece but duplicates verts along the cut, pinching at the tip")
+def test_open_dart_curve_splits_vertices():
+    _clean_scene()
+    bpy.ops.mesh.primitive_grid_add(x_subdivisions=6, y_subdivisions=6, size=2.0)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Grid"
+    base_vert_count = len(mesh_obj.data.vertices)
+    base_face_count = len(mesh_obj.data.polygons)
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.usbee.add_seam_curve()
+    curve_obj = bpy.context.active_object
+    spline = curve_obj.data.splines[0]
+    # Starts at the mesh boundary (x=-1), ends at an interior point (the
+    # dart tip) - deliberately NOT cyclic, i.e. an open cut, not a loop.
+    spline.points[0].co = (-1.0, 0.0, 0.0, 1.0)
+    spline.points[1].co = (-0.3, 0.0, 0.0, 1.0)
+    spline.use_cyclic_u = False
+    bpy.ops.usbee.bind_seam_curve()
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    result = bpy.ops.usbee.flatten_all()
+    assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
+    assert len(mesh_obj.usbee_pieces) == 1, (
+        "an open dart cut shouldn't split the mesh into separate islands - "
+        "it's a slit, not a boundary"
+    )
+
+    flat_obj = bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object]
+    assert len(flat_obj.data.polygons) == base_face_count, "face count shouldn't change"
+    assert len(flat_obj.data.vertices) > base_vert_count, (
+        "expected extra vertices duplicated along the interior dart cut so "
+        "it can open into a gap when flattened, instead of BFF seeing a "
+        "fully-connected mesh with the cut silently ignored"
+    )
+
+
 @test("SVG export: writes a well-formed file with the right piece count")
 def test_svg_export():
     _clean_scene()
