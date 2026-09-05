@@ -170,11 +170,15 @@ def _flatten_pieces(context, mesh_obj, piece_ids):
         if not piece.flatten_dirty and piece_ids is None:
             continue
 
+        piece.error_message = ""
+
         island_face_indices = [i for i, isl in face_island.items() if isl == piece.piece_id]
         try:
             islands.validate_island_topology(bm, island_face_indices)
         except islands.TopologyError as exc:
-            errors.append(f"Piece '{piece.name}': {exc}")
+            msg = str(exc)
+            piece.error_message = msg
+            errors.append(f"Piece '{piece.name}': {msg}")
             continue
 
         # Duplicates vertices along any seam edges internal to this island
@@ -187,7 +191,9 @@ def _flatten_pieces(context, mesh_obj, piece_ids):
         try:
             out_verts, out_faces = bff.flatten_island(binary_path, verts_list, faces_local)
         except bff.BFFError as exc:
-            errors.append(f"Piece '{piece.name}': {exc}")
+            msg = str(exc)
+            piece.error_message = msg
+            errors.append(f"Piece '{piece.name}': {msg}")
             continue
 
         area_3d = sum(_face_area_3d(verts_list, f) for f in faces_local)
@@ -198,7 +204,9 @@ def _flatten_pieces(context, mesh_obj, piece_ids):
         try:
             loop_indices = boundary.ordered_boundary_loop(out_faces)
         except boundary.BoundaryError as exc:
-            errors.append(f"Piece '{piece.name}': {exc}")
+            msg = str(exc)
+            piece.error_message = msg
+            errors.append(f"Piece '{piece.name}': {msg}")
             continue
         boundary_loop_2d = [(out_verts[i][0], out_verts[i][1]) for i in loop_indices]
 
@@ -221,6 +229,7 @@ def _flatten_pieces(context, mesh_obj, piece_ids):
         try:
             _update_cut_line(context, mesh_obj, piece, flat_obj, placed_boundary)
         except RuntimeError as exc:
+            piece.error_message = str(exc)
             errors.append(str(exc))
 
         piece.flatten_dirty = False

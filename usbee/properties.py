@@ -81,6 +81,10 @@ class UsbeePieceSettings(PropertyGroup):
         name="Cut Line Object",
         description="Name of the generated offset-boundary Curve object, if offset_mm != 0",
     )
+    error_message: StringProperty(
+        name="Error",
+        description="Set when the last flatten attempt for this piece failed; cleared on success",
+    )
     sample_point: FloatVectorProperty(
         name="Sample Point",
         description=(

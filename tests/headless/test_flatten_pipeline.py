@@ -43,7 +43,6 @@ def _add_seam_curve_for(mesh_obj, world_points, cyclic=True):
     for i, p in enumerate(world_points):
         spline.points[i].co = (p.x, p.y, p.z, 1.0)
     spline.use_cyclic_u = cyclic
-    bpy.ops.usbee.bind_seam_curve()
     return curve_obj
 
 
@@ -235,8 +234,6 @@ def test_partial_rebake_only_touches_edited_piece():
             centroid.z + (co.z - centroid.z) * 0.9,
             1.0,
         )
-    bpy.context.view_layer.objects.active = curve_obj
-    assert bpy.ops.usbee.bind_seam_curve() == {"FINISHED"}
     bpy.context.view_layer.objects.active = mesh_obj
 
     mesh_obj.usbee_active_piece_index = list(mesh_obj.usbee_pieces).index(small_piece)
@@ -266,7 +263,6 @@ def test_open_dart_curve_splits_vertices():
     spline.points[0].co = (-1.0, 0.0, 0.0, 1.0)
     spline.points[1].co = (-0.3, 0.0, 0.0, 1.0)
     spline.use_cyclic_u = False
-    bpy.ops.usbee.bind_seam_curve()
 
     bpy.context.view_layer.objects.active = mesh_obj
     result = bpy.ops.usbee.flatten_all()
@@ -282,6 +278,49 @@ def test_open_dart_curve_splits_vertices():
         "expected extra vertices duplicated along the interior dart cut so "
         "it can open into a gap when flattened, instead of BFF seeing a "
         "fully-connected mesh with the cut silently ignored"
+    )
+
+
+@test("modifiers on the seam curve itself (Array) are respected when resolving cuts")
+def test_seam_curve_array_modifier():
+    _clean_scene()
+    bpy.ops.mesh.primitive_grid_add(x_subdivisions=8, y_subdivisions=4, size=4.0)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "WideGrid"
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.usbee.add_seam_curve()
+    curve_obj = bpy.context.active_object
+    # A single short open dart near the left edge...
+    spline = curve_obj.data.splines[0]
+    spline.points[0].co = (-2.0, 0.0, 0.0, 1.0)
+    spline.points[1].co = (-1.5, 0.0, 0.0, 1.0)
+    spline.use_cyclic_u = False
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    baseline = bpy.ops.usbee.flatten_all()
+    assert baseline == {"FINISHED"}
+    single_dart_verts = len(bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object].data.vertices)
+
+    # ...arrayed into 3 copies spread across the grid. If the resolver reads
+    # the curve's raw (un-arrayed) points instead of its evaluated geometry,
+    # this would have no additional effect versus the single-dart baseline.
+    array_mod = curve_obj.modifiers.new(name="Array", type="ARRAY")
+    array_mod.count = 2
+    array_mod.use_relative_offset = False
+    array_mod.use_constant_offset = True
+    array_mod.constant_offset_displace = (0.0, 1.0, 0.0)
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    result = bpy.ops.usbee.flatten_all()
+    assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
+    assert len(mesh_obj.usbee_pieces) == 1, "darts shouldn't split the mesh into separate islands"
+
+    arrayed_verts = len(bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object].data.vertices)
+    assert arrayed_verts > single_dart_verts, (
+        f"Array modifier on the seam curve had no effect - resolver is "
+        f"reading raw curve points instead of evaluated (post-modifier) "
+        f"geometry (single-dart verts={single_dart_verts}, arrayed verts={arrayed_verts})"
     )
 
 

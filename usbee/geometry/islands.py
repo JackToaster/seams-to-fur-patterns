@@ -1,71 +1,110 @@
-"""Seam curve binding, resolution to mesh edges, and island isolation.
+"""Seam curve resolution to mesh edges, and island isolation.
 
-Phase 1 scope: seam curves are bound to the surface via raycast at bind time
-(barycentric-ish nearest-face binding), then resolved at bake time by
-snapping each bound point to its nearest mesh vertex and walking a shortest
-edge path between consecutive snapped points. This is a deliberate scope
-reduction from true continuous curve-to-mesh bisection (see plan) - it keeps
-seam curves editable without requiring users to pick existing edges, while
-avoiding the much harder arbitrary-line mesh-cutting problem.
+Phase 1 scope: seam curves are resolved to mesh seam edges by evaluating the
+curve's live (post-modifier) geometry - so a Shrinkwrap keeping it glued to
+the surface, or Array/Mirror duplicating it, are respected automatically -
+then snapping each resulting point to its nearest mesh vertex and walking a
+shortest edge path between consecutive snapped points. This is a deliberate
+scope reduction from true continuous curve-to-mesh bisection (see plan) - it
+keeps seam curves editable without requiring users to pick existing edges,
+while avoiding the much harder arbitrary-line mesh-cutting problem.
+
+Resolution always re-evaluates the curve fresh (no separate "bind" step or
+cache): correctness with live modifiers requires it, and it's cheap enough
+(seam curves have few points) to not need caching in Phase 1.
 
 The scene mesh is never mutated by anything in this module; callers pass an
 evaluated BMesh copy.
 """
 
 import heapq
-import json
 import uuid as uuid_mod
 
-import bmesh
 import bpy
-from mathutils.bvhtree import BVHTree
-
-BIND_DATA_PROP = "usbee_bind_data"
 
 
 class TopologyError(Exception):
     """Raised when an island isn't valid disk topology for flattening."""
 
 
-def bind_curve_to_mesh(curve_obj, mesh_obj):
-    """Raycast each spline point of curve_obj onto mesh_obj and store the
-    binding (nearest face index + the hit point's local-space position, used
-    to re-derive barycentric weights at resolve time) as a JSON blob on the
-    curve object.
+def _extract_curve_chains(curve_obj, depsgraph):
+    """Evaluate curve_obj (with modifiers applied) and return a list of
+    (is_closed, [Vector, ...]) chains in the curve object's local space -
+    one chain per resulting spline, so Array/Mirror modifiers that produce
+    multiple loops/paths from one source spline are all included.
+
+    Bevel/fill (used to make the curve visibly thick in the viewport) turns
+    to_mesh() into a tube/ribbon surface instead of a plain polyline, which
+    would corrupt path extraction below - temporarily zero them for this
+    evaluation only, then restore, so display and resolution don't conflict.
     """
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_obj = mesh_obj.evaluated_get(depsgraph)
-    mesh = eval_obj.to_mesh()
+    orig_bevel_depth = curve_obj.data.bevel_depth
+    curve_obj.data.bevel_depth = 0.0
+    depsgraph.update()
+    try:
+        eval_obj = curve_obj.evaluated_get(depsgraph)
+        eval_mesh = eval_obj.to_mesh()
 
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-    bm.faces.ensure_lookup_table()
-    bvh = BVHTree.FromBMesh(bm)
+        verts = [v.co.copy() for v in eval_mesh.vertices]
+        adjacency = {}
+        for e in eval_mesh.edges:
+            a, b = e.vertices[0], e.vertices[1]
+            adjacency.setdefault(a, []).append(b)
+            adjacency.setdefault(b, []).append(a)
 
-    bindings = []
-    for spline in curve_obj.data.splines:
-        points = spline.bezier_points if spline.type == "BEZIER" else spline.points
-        for pt in points:
-            # Project the curve point (world space via curve's own transform)
-            # into the mesh object's local space, then find the nearest
-            # surface point on the mesh.
-            co_world = curve_obj.matrix_world @ pt.co.to_3d()
-            co_mesh_local = mesh_obj.matrix_world.inverted() @ co_world
-            hit_co, hit_normal, hit_face_idx, hit_dist = bvh.find_nearest(co_mesh_local)
-            if hit_face_idx is None:
-                bindings.append(None)
-                continue
-            bindings.append(
-                {
-                    "face_index": hit_face_idx,
-                    "local_co": [hit_co.x, hit_co.y, hit_co.z],
-                }
+        eval_obj.to_mesh_clear()
+    finally:
+        curve_obj.data.bevel_depth = orig_bevel_depth
+        depsgraph.update()
+
+    def edge_key(a, b):
+        return (a, b) if a < b else (b, a)
+
+    visited_edges = set()
+    chains = []
+
+    # Open chains: walk from each degree-1 vertex to its other end.
+    endpoints = [v for v, nbrs in adjacency.items() if len(nbrs) == 1]
+    for start in endpoints:
+        if edge_key(start, adjacency[start][0]) in visited_edges:
+            continue
+        chain_indices = [start]
+        current = start
+        while True:
+            next_v = next(
+                (n for n in adjacency[current] if edge_key(current, n) not in visited_edges),
+                None,
             )
+            if next_v is None:
+                break
+            visited_edges.add(edge_key(current, next_v))
+            chain_indices.append(next_v)
+            current = next_v
+        chains.append((False, [verts[i] for i in chain_indices]))
 
-    bm.free()
-    eval_obj.to_mesh_clear()
+    # Closed loops: any vertices with remaining unvisited edges are cycles
+    # (everything of degree 1 was already consumed by the open-chain pass).
+    for start in adjacency:
+        remaining = [n for n in adjacency[start] if edge_key(start, n) not in visited_edges]
+        if not remaining:
+            continue
+        chain_indices = [start]
+        current = start
+        while True:
+            next_v = next(
+                (n for n in adjacency[current] if edge_key(current, n) not in visited_edges),
+                None,
+            )
+            if next_v is None:
+                break
+            visited_edges.add(edge_key(current, next_v))
+            if next_v == start:
+                break
+            chain_indices.append(next_v)
+            current = next_v
+        chains.append((True, [verts[i] for i in chain_indices]))
 
-    curve_obj[BIND_DATA_PROP] = json.dumps(bindings)
+    return chains
 
 
 def _nearest_vert_on_mesh(bm, local_co):
@@ -121,39 +160,38 @@ def _shortest_edge_path(bm, start_vert, end_vert):
 
 
 def resolve_curve_seam_edges(bm, curve_obj, mesh_obj):
-    """Resolve a bound seam curve to a set of bmesh edge indices on bm."""
-    raw = curve_obj.get(BIND_DATA_PROP)
-    if not raw:
-        raise TopologyError(f"Seam curve '{curve_obj.name}' is not bound to a mesh yet")
-    bindings = json.loads(raw)
+    """Resolve a seam curve to a set of bmesh edge indices on bm.
 
-    snapped_verts = []
-    for b in bindings:
-        if b is None:
-            continue
-        from mathutils import Vector
+    Evaluates curve_obj fresh (through its modifier stack) every call, so a
+    Shrinkwrap keeping it glued to the surface or an Array/Mirror producing
+    extra copies are always respected - see module docstring.
+    """
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    chains = _extract_curve_chains(curve_obj, depsgraph)
+    if not chains:
+        raise TopologyError(f"Seam curve '{curve_obj.name}' has no points")
 
-        local_co = Vector(b["local_co"])
-        snapped_verts.append(_nearest_vert_on_mesh(bm, local_co))
+    to_mesh_local = mesh_obj.matrix_world.inverted() @ curve_obj.matrix_world
 
     seam_edges = set()
-    is_closed = False
-    if curve_obj.data.splines and curve_obj.data.splines[0].use_cyclic_u:
-        is_closed = True
+    for is_closed, points in chains:
+        if len(points) < 2:
+            continue
+        snapped_verts = [_nearest_vert_on_mesh(bm, to_mesh_local @ p) for p in points]
 
-    pairs = list(zip(snapped_verts, snapped_verts[1:]))
-    if is_closed and len(snapped_verts) > 2:
-        pairs.append((snapped_verts[-1], snapped_verts[0]))
+        pairs = list(zip(snapped_verts, snapped_verts[1:]))
+        if is_closed and len(snapped_verts) > 2:
+            pairs.append((snapped_verts[-1], snapped_verts[0]))
 
-    for a, b in pairs:
-        path = _shortest_edge_path(bm, a, b)
-        if path is None:
-            raise TopologyError(
-                f"Seam curve '{curve_obj.name}' has points that resolve to "
-                f"disconnected regions of the mesh"
-            )
-        for e in path:
-            seam_edges.add(e.index)
+        for a, b in pairs:
+            path = _shortest_edge_path(bm, a, b)
+            if path is None:
+                raise TopologyError(
+                    f"Seam curve '{curve_obj.name}' has points that resolve to "
+                    f"disconnected regions of the mesh"
+                )
+            for e in path:
+                seam_edges.add(e.index)
 
     return seam_edges
 
@@ -377,6 +415,7 @@ def sync_piece_settings(obj, bm, face_island, island_count):
             "grain_direction": tuple(p.grain_direction),
             "flattened_object": p.flattened_object,
             "cut_line_object": p.cut_line_object,
+            "error_message": p.error_message,
         }
         for p in obj.usbee_pieces
     }
@@ -394,6 +433,7 @@ def sync_piece_settings(obj, bm, face_island, island_count):
             entry.grain_direction = old["grain_direction"]
             entry.flattened_object = old["flattened_object"]
             entry.cut_line_object = old["cut_line_object"]
+            entry.error_message = old["error_message"]
         else:
             entry.name = f"Piece {island_id + 1}"
         entry.flatten_dirty = True

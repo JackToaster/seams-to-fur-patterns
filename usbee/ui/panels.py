@@ -8,8 +8,10 @@ class USBEE_UL_pieces(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "name", text="", emboss=False, icon="MESH_DATA")
-        if item.flatten_dirty:
+        if item.error_message:
             row.label(text="", icon="ERROR")
+        elif item.flatten_dirty:
+            row.label(text="", icon="FILE_REFRESH")
         row.prop(item, "offset_mm", text="")
 
 
@@ -59,6 +61,17 @@ class USBEE_PT_main(Panel):
             rows=4,
         )
 
+        if 0 <= obj.usbee_active_piece_index < len(obj.usbee_pieces):
+            active_piece = obj.usbee_pieces[obj.usbee_active_piece_index]
+            if active_piece.error_message:
+                err_box = layout.box()
+                err_box.alert = True
+                col = err_box.column(align=True)
+                col.label(text=f"'{active_piece.name}' failed to flatten:", icon="ERROR")
+                for line in active_piece.error_message.split("\n"):
+                    if line.strip():
+                        col.label(text=line.strip())
+
         row = layout.row(align=True)
         row.operator("usbee.flatten_piece", icon="FILE_REFRESH")
         row.operator("usbee.reset_placement", icon="LOOP_BACK")
@@ -68,27 +81,9 @@ class USBEE_PT_main(Panel):
         layout.operator("usbee.export_svg", icon="EXPORT")
 
 
-class USBEE_PT_seam_curve(Panel):
-    bl_label = "Seam Curve"
-    bl_idname = "USBEE_PT_seam_curve"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "USBee"
-    bl_parent_id = "USBEE_PT_main"
-
-    @classmethod
-    def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == "CURVE"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.operator("usbee.bind_seam_curve", icon="SNAP_ON")
-
-
 _classes = (
     USBEE_UL_pieces,
     USBEE_PT_main,
-    USBEE_PT_seam_curve,
 )
 
 
