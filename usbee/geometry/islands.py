@@ -21,8 +21,6 @@ import bpy
 from mathutils.bvhtree import BVHTree
 
 BIND_DATA_PROP = "usbee_bind_data"
-PIECE_ID_ATTR = "usbee_piece_id"
-SEAM_RESOLVED_ATTR = "usbee_seam_resolved"
 
 
 class TopologyError(Exception):
@@ -309,40 +307,62 @@ def validate_island_topology(bm, face_indices):
     return True
 
 
-def sync_piece_settings(obj, face_island, island_count):
+def _island_centroid(bm, face_indices):
+    from mathutils import Vector
+
+    total = Vector((0.0, 0.0, 0.0))
+    for f_idx in face_indices:
+        total += bm.faces[f_idx].calc_center_median()
+    return total / len(face_indices)
+
+
+def sync_piece_settings(obj, bm, face_island, island_count):
     """Reconcile obj.usbee_pieces with the freshly computed islands, keeping
-    existing UUIDs (and therefore offset/color/etc settings) for islands that
-    substantially overlap a previous piece_id, via best-face-count-overlap
-    matching rather than resetting on every re-bake.
+    existing UUIDs (and therefore offset/color/etc settings) for islands
+    that are spatially close to a previous piece's sample point.
+
+    Matching is by nearest 3D centroid rather than a persisted per-face
+    attribute: islands are computed from the *evaluated* (post-modifier)
+    mesh, whose face indices/count aren't stable across bakes when a
+    generative modifier like Subdivision Surface is in the stack, so a
+    face-index-keyed attribute on the base mesh can't be used to track
+    identity here.
     """
-    mesh = obj.data
-    prev_attr = mesh.attributes.get(PIECE_ID_ATTR)
-    prev_face_to_piece = {}
-    if prev_attr is not None:
-        for poly in mesh.polygons:
-            prev_face_to_piece[poly.index] = prev_attr.data[poly.index].value
-
-    # island_id -> {prev_piece_id: overlap_count}
-    overlap = {}
+    island_faces = {}
     for face_idx, island_id in face_island.items():
-        prev_piece_id = prev_face_to_piece.get(face_idx)
-        if prev_piece_id is None:
-            continue
-        bucket = overlap.setdefault(island_id, {})
-        bucket[prev_piece_id] = bucket.get(prev_piece_id, 0) + 1
+        island_faces.setdefault(island_id, []).append(face_idx)
 
-    prev_piece_id_to_uuid = {p.piece_id: p.uuid for p in obj.usbee_pieces}
+    island_centroids = {
+        island_id: _island_centroid(bm, faces) for island_id, faces in island_faces.items()
+    }
+    from mathutils import Vector
+
+    prev_points = [(p.uuid, Vector(p.sample_point)) for p in obj.usbee_pieces if p.uuid]
+
+    # Greedy nearest-centroid matching: repeatedly pick the closest
+    # (island, previous piece) pair, consuming both sides, until no pairs
+    # remain. Good enough for the common case of one incremental seam edit
+    # at a time; a full optimal assignment isn't worth the complexity here.
+    candidates = []
+    for island_id, centroid in island_centroids.items():
+        for uuid_str, sample_point in prev_points:
+            dist = (centroid - sample_point).length
+            candidates.append((dist, island_id, uuid_str))
+    candidates.sort(key=lambda c: c[0])
+
+    island_to_uuid = {}
+    used_uuids = set()
+    for _dist, island_id, uuid_str in candidates:
+        if island_id in island_to_uuid or uuid_str in used_uuids:
+            continue
+        island_to_uuid[island_id] = uuid_str
+        used_uuids.add(uuid_str)
 
     new_pieces_data = []
-    used_uuids = set()
     for island_id in range(island_count):
-        best_prev = None
-        if island_id in overlap:
-            best_prev = max(overlap[island_id].items(), key=lambda kv: kv[1])[0]
-        piece_uuid = prev_piece_id_to_uuid.get(best_prev)
-        if piece_uuid is None or piece_uuid in used_uuids:
+        piece_uuid = island_to_uuid.get(island_id)
+        if piece_uuid is None:
             piece_uuid = str(uuid_mod.uuid4())
-        used_uuids.add(piece_uuid)
         new_pieces_data.append((island_id, piece_uuid))
 
     # Snapshot into plain dicts before clearing - obj.usbee_pieces.clear()
@@ -365,6 +385,7 @@ def sync_piece_settings(obj, face_island, island_count):
         entry = obj.usbee_pieces.add()
         entry.piece_id = island_id
         entry.uuid = piece_uuid
+        entry.sample_point = island_centroids[island_id]
         old = old_by_uuid.get(piece_uuid)
         if old is not None:
             entry.name = old["name"]
@@ -376,11 +397,3 @@ def sync_piece_settings(obj, face_island, island_count):
         else:
             entry.name = f"Piece {island_id + 1}"
         entry.flatten_dirty = True
-
-
-def write_piece_id_attribute(mesh, face_island):
-    attr = mesh.attributes.get(PIECE_ID_ATTR)
-    if attr is None:
-        attr = mesh.attributes.new(name=PIECE_ID_ATTR, type="INT", domain="FACE")
-    for poly in mesh.polygons:
-        attr.data[poly.index].value = face_island.get(poly.index, -1)

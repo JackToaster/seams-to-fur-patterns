@@ -74,6 +74,29 @@ def test_cube_two_islands():
     assert face_counts == [1, 5], f"expected face counts [1, 5], got {face_counts}"
 
 
+@test("modifiers (Subdivision Surface) are applied before flattening, not the low-poly base cage")
+def test_modifiers_applied_before_flatten():
+    _clean_scene()
+    bpy.ops.mesh.primitive_grid_add(x_subdivisions=2, y_subdivisions=2, size=2.0)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "CoarsePlane"
+    base_face_count = len(mesh_obj.data.polygons)
+
+    mod = mesh_obj.modifiers.new(name="Subdivision", type="SUBSURF")
+    mod.levels = 3
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    result = bpy.ops.usbee.flatten_all()
+    assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
+
+    flat_obj = bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object]
+    assert len(flat_obj.data.polygons) > base_face_count, (
+        f"expected the subdivided surface ({base_face_count} base faces) to "
+        f"be flattened, but got only {len(flat_obj.data.polygons)} faces - "
+        f"looks like the low-poly base cage was flattened instead"
+    )
+
+
 @test("topology validation: an un-seamed closed mesh is rejected, not silently flattened")
 def test_closed_mesh_rejected():
     _clean_scene()

@@ -130,11 +130,25 @@ def _update_cut_line(context, mesh_obj, piece, flat_obj, boundary_loop_2d):
     piece.cut_line_object = curve_obj.name
 
 
-def _flatten_pieces(context, mesh_obj, piece_ids):
+def _evaluated_bmesh(context, mesh_obj):
+    """Builds a BMesh from the object's fully evaluated (post-modifier)
+    mesh, so e.g. a Subdivision Surface modifier's smoothed result gets
+    flattened rather than the low-poly base cage."""
+    depsgraph = context.evaluated_depsgraph_get()
+    eval_obj = mesh_obj.evaluated_get(depsgraph)
+    eval_mesh = eval_obj.to_mesh()
+
     bm = bmesh.new()
-    bm.from_mesh(mesh_obj.data)
+    bm.from_mesh(eval_mesh)
     bm.verts.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
+
+    eval_obj.to_mesh_clear()
+    return bm
+
+
+def _flatten_pieces(context, mesh_obj, piece_ids):
+    bm = _evaluated_bmesh(context, mesh_obj)
 
     seam_curves = _find_seam_curves_for(mesh_obj)
     seam_edges = set()
@@ -142,8 +156,7 @@ def _flatten_pieces(context, mesh_obj, piece_ids):
         seam_edges |= islands.resolve_curve_seam_edges(bm, curve_obj, mesh_obj)
 
     face_island, island_count = islands.isolate_islands(bm, seam_edges)
-    islands.sync_piece_settings(mesh_obj, face_island, island_count)
-    islands.write_piece_id_attribute(mesh_obj.data, face_island)
+    islands.sync_piece_settings(mesh_obj, bm, face_island, island_count)
 
     binary_path = bff.find_binary(_addon_dir())
 

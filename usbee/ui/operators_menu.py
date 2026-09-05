@@ -4,7 +4,8 @@ import bpy
 def draw_object_menu(self, context):
     layout = self.layout
     layout.separator()
-    layout.operator("usbee.add_seam_curve", text="Add Seam Curve")
+    layout.operator("usbee.draw_seam_curve", text="Draw Seam Curve")
+    layout.operator("usbee.add_seam_curve", text="Add Blank Seam Curve")
     layout.operator("usbee.flatten_all", text="Flatten All Pieces")
 
 

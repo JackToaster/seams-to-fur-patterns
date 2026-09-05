@@ -44,7 +44,8 @@ class USBEE_PT_main(Panel):
             layout.label(text="Select a mesh object", icon="INFO")
             return
 
-        layout.operator("usbee.add_seam_curve", icon="CURVE_DATA")
+        layout.operator("usbee.draw_seam_curve", icon="GREASEPENCIL", text="Draw Seam Curve")
+        layout.operator("usbee.add_seam_curve", icon="CURVE_DATA", text="Add Blank Seam Curve")
 
         col = layout.column()
         col.label(text="Pieces:")

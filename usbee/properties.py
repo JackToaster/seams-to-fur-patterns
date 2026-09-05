@@ -81,6 +81,16 @@ class UsbeePieceSettings(PropertyGroup):
         name="Cut Line Object",
         description="Name of the generated offset-boundary Curve object, if offset_mm != 0",
     )
+    sample_point: FloatVectorProperty(
+        name="Sample Point",
+        description=(
+            "Local-space centroid of one face in this piece from the last "
+            "bake, used to re-identify the same piece across re-bakes since "
+            "modifiers (e.g. Subdivision) mean face indices aren't stable "
+            "between evaluations"
+        ),
+        size=3,
+    )
 
     # --- Reserved for Phase 2, unused in Phase 1 ---
     color: FloatVectorProperty(
