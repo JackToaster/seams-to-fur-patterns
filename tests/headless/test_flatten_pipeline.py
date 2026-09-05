@@ -12,6 +12,7 @@ there's nothing binary to keep in sync with the addon's schema.
 import sys
 import traceback
 
+import bmesh
 import bpy
 import mathutils
 
@@ -322,6 +323,81 @@ def test_seam_curve_tube_hugs_surface():
         f"through the interior - min radius {min(radii)} is far from the "
         f"sphere's surface at radius 1.0"
     )
+
+
+@test("seam curve on a mirror-modifier seam doesn't zigzag between the two mirrored halves")
+def test_seam_curve_mirror_bias_no_zigzag():
+    _clean_scene()
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=24, ring_count=12)
+    base = bpy.context.active_object
+    base.name = "MirrorSphere"
+    bm = bmesh.new()
+    bm.from_mesh(base.data)
+    bmesh.ops.bisect_plane(
+        bm, geom=bm.verts[:] + bm.edges[:] + bm.faces[:], plane_co=(0, 0, 0), plane_no=(1, 0, 0), clear_inner=True
+    )
+    bm.to_mesh(base.data)
+    bm.free()
+    base.data.update()
+    mirror_mod = base.modifiers.new("Mirror", "MIRROR")
+    mirror_mod.use_axis = (True, False, False)
+
+    bpy.context.view_layer.objects.active = base
+    bpy.ops.usbee.add_seam_curve()
+    curve_obj = bpy.context.active_object
+    spline = curve_obj.data.splines[0]
+    # A straight line running exactly along the mirror seam (x=0) - without
+    # the bias fix, resampled points along this line flip unpredictably
+    # between the left and right mirrored surface (both equally "nearest"),
+    # producing a zigzag that crosses back and forth across x=0.
+    spline.points[0].co = (0.0, -0.9, 0.3, 1.0)
+    spline.points[1].co = (0.0, 0.9, 0.3, 1.0)
+    spline.use_cyclic_u = False
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    eval_obj = curve_obj.evaluated_get(depsgraph)
+    eval_mesh = eval_obj.to_mesh()
+    xs = [v.co.x for v in eval_mesh.vertices]
+    eval_obj.to_mesh_clear()
+
+    signs = {1 if x > 1e-6 else (-1 if x < -1e-6 else 0) for x in xs}
+    assert signs != {1, -1}, (
+        f"tube crosses back and forth across the mirror plane (x values on "
+        f"both sides: {sorted(set(round(x, 4) for x in xs))}) - the bias "
+        f"nudge that should break the nearest-surface tie isn't working"
+    )
+
+
+@test("a new seam curve can snap to segments of an already-drawn one on the same mesh")
+def test_snap_to_other_seam_curve_segments():
+    _clean_scene()
+    bpy.ops.mesh.primitive_grid_add(x_subdivisions=4, y_subdivisions=4, size=2.0)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Grid"
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.usbee.add_seam_curve()
+    existing_curve = bpy.context.active_object
+    existing_curve.name = "ExistingSeam"
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.usbee.add_seam_curve()
+    new_curve = bpy.context.active_object
+    assert new_curve is not existing_curve
+
+    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+
+    segments = seam_curve_ops._other_seam_curve_segments(bpy.context, mesh_obj, exclude_curve_obj=new_curve)
+    assert len(segments) == 1, f"expected exactly 1 segment from the other curve, got {len(segments)}"
+
+    # Excluding the *other* curve instead should find the same count again
+    # are identical 2-point blanks at the same seed location, so this also
+    # confirms exclusion is by identity, not by content).
+    segments_excluding_existing = seam_curve_ops._other_seam_curve_segments(
+        bpy.context, mesh_obj, exclude_curve_obj=existing_curve
+    )
+    assert len(segments_excluding_existing) == 1, "expected to find new_curve's segment instead"
 
 
 @test("modifiers on the seam curve itself (Array) are respected when resolving cuts")
