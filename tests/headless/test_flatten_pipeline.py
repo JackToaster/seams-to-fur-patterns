@@ -282,6 +282,48 @@ def test_open_dart_curve_splits_vertices():
     )
 
 
+@test("seam curve display tube hugs a curved surface (subdivide -> project -> thicken order)")
+def test_seam_curve_tube_hugs_surface():
+    _clean_scene()
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=24, ring_count=12)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Sphere"
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.usbee.add_seam_curve()
+    curve_obj = bpy.context.active_object
+    # A straight chord across the sphere - if projection ran before/without
+    # subdivision (or in the wrong order relative to thickening), this
+    # would look like a straight rod poking through the interior instead of
+    # a tube hugging the curved surface.
+    spline = curve_obj.data.splines[0]
+    spline.points[0].co = (-0.9, 0.0, 0.4, 1.0)
+    spline.points[1].co = (0.9, 0.0, 0.4, 1.0)
+    spline.use_cyclic_u = False
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    eval_obj = curve_obj.evaluated_get(depsgraph)
+    eval_mesh = eval_obj.to_mesh()
+    verts = [tuple(v.co) for v in eval_mesh.vertices]
+    eval_obj.to_mesh_clear()
+
+    assert len(verts) > 20, (
+        f"expected the display tube to be resampled into many points to "
+        f"hug the surface, got only {len(verts)} raw vertices"
+    )
+    radii = [(x * x + y * y + z * z) ** 0.5 for x, y, z in verts]
+    assert max(radii) < 1.02, (
+        f"tube shouldn't balloon outward - max radius {max(radii)} suggests "
+        f"projection isn't actually pulling points onto the sphere"
+    )
+    assert min(radii) > 0.9, (
+        f"tube shouldn't sink into the sphere or stay as a straight chord "
+        f"through the interior - min radius {min(radii)} is far from the "
+        f"sphere's surface at radius 1.0"
+    )
+
+
 @test("modifiers on the seam curve itself (Array) are respected when resolving cuts")
 def test_seam_curve_array_modifier():
     _clean_scene()

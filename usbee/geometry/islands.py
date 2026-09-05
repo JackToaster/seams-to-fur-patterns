@@ -22,6 +22,8 @@ import uuid as uuid_mod
 
 import bpy
 
+from . import curve_display
+
 
 class TopologyError(Exception):
     """Raised when an island isn't valid disk topology for flattening."""
@@ -33,13 +35,14 @@ def _extract_curve_chains(curve_obj, depsgraph):
     one chain per resulting spline, so Array/Mirror modifiers that produce
     multiple loops/paths from one source spline are all included.
 
-    Bevel/fill (used to make the curve visibly thick in the viewport) turns
-    to_mesh() into a tube/ribbon surface instead of a plain polyline, which
-    would corrupt path extraction below - temporarily zero them for this
-    evaluation only, then restore, so display and resolution don't conflict.
+    The "USBee Surface Follow" geometry-nodes modifier (visual tube; see
+    geometry.curve_display) turns to_mesh() into a tube surface instead of a
+    plain polyline, which would corrupt path extraction below - temporarily
+    disable it for this evaluation only, then restore, so display and
+    resolution don't conflict. Any *other* modifiers (Array, Mirror, etc.)
+    stay active, since those should affect the resolved cut.
     """
-    orig_bevel_depth = curve_obj.data.bevel_depth
-    curve_obj.data.bevel_depth = 0.0
+    was_enabled = curve_display.set_modifier_enabled(curve_obj, False)
     depsgraph.update()
     try:
         eval_obj = curve_obj.evaluated_get(depsgraph)
@@ -54,7 +57,8 @@ def _extract_curve_chains(curve_obj, depsgraph):
 
         eval_obj.to_mesh_clear()
     finally:
-        curve_obj.data.bevel_depth = orig_bevel_depth
+        if was_enabled is not None:
+            curve_display.set_modifier_enabled(curve_obj, was_enabled)
         depsgraph.update()
 
     def edge_key(a, b):

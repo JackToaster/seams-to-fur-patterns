@@ -2,19 +2,23 @@ import bmesh
 import bpy
 from bpy.types import Operator
 from bpy_extras import view3d_utils
+from mathutils import Vector
 from mathutils.bvhtree import BVHTree
+
+from ..geometry import curve_display
 
 SEAM_CURVE_COLLECTION = "USBee Seam Curves"
 SOURCE_OBJECT_PROP = "usbee_seam_source_object"
 
 CLOSE_LOOP_PIXEL_RADIUS = 15
+SNAP_PIXEL_RADIUS = 20
 # Ignore a click landing within this distance (in mesh-local units) of the
 # previously placed point - a real click that close is almost always an
 # accidental double-registration, not an intentional second point.
 MIN_POINT_SPACING = 1e-5
 
 SEAM_CURVE_COLOR = (1.0, 0.15, 0.05, 1.0)
-SEAM_CURVE_BEVEL_DEPTH = 0.0025
+PREVIEW_POINT_RADIUS = curve_display.TUBE_RADIUS * 4
 
 
 def _get_or_create_collection(context):
@@ -39,11 +43,13 @@ def _get_or_create_seam_curve_material():
 
 
 def _make_seam_curve_visible(curve_obj):
-    """Give the curve real on-screen thickness and draw it through occluding
-    geometry, so it's never invisible just because it sits flush against
-    (or slightly inside) a convex/concave part of the surface."""
-    curve_obj.data.bevel_depth = SEAM_CURVE_BEVEL_DEPTH
-    curve_obj.data.fill_mode = "FULL"
+    """Draw the curve through occluding geometry, so it's never invisible
+    just because it sits flush against (or slightly inside) a convex/
+    concave part of the surface. Actual on-screen thickness comes from the
+    "USBee Surface Follow" geometry-nodes modifier (see curve_display),
+    not curve bevel - a curve's own bevel is baked into its base mesh
+    *before* modifiers run, which would make a Shrinkwrap-style surface
+    projection squash the tube instead of gluing a thin centerline."""
     curve_obj.show_in_front = True
     curve_obj.color = SEAM_CURVE_COLOR
     mat = _get_or_create_seam_curve_material()
@@ -51,19 +57,33 @@ def _make_seam_curve_visible(curve_obj):
         curve_obj.data.materials.append(mat)
 
 
-def _add_shrinkwrap(curve_obj, mesh_obj):
-    """Keeps the curve glued to mesh_obj's surface regardless of exactly
-    where its points were placed, and as the mesh deforms."""
-    mod = curve_obj.modifiers.new(name="Shrinkwrap", type="SHRINKWRAP")
-    mod.target = mesh_obj
-    mod.wrap_method = "NEAREST_SURFACEPOINT"
-    return mod
+def _add_surface_follow(curve_obj, mesh_obj):
+    segment_length = max(mesh_obj.dimensions) * 0.02 or 0.02
+    return curve_display.add_or_update_modifier(curve_obj, mesh_obj, segment_length)
+
+
+def _mirror_plane(mesh_obj):
+    """Returns (plane_point_world, plane_normal_world) for the mesh's
+    Mirror modifier symmetry plane, or the world Y-Z plane (X=0) if it has
+    none - see geometry.curve_display module docstring for why this
+    matters for dart/seam placement on symmetric models."""
+    for mod in mesh_obj.modifiers:
+        if mod.type == "MIRROR":
+            axis_index = next((i for i in range(3) if mod.use_axis[i]), 0)
+            pivot = mod.mirror_object or mesh_obj
+            normal_local = Vector((1.0, 0.0, 0.0)) if axis_index == 0 else (
+                Vector((0.0, 1.0, 0.0)) if axis_index == 1 else Vector((0.0, 0.0, 1.0))
+            )
+            normal_world = (pivot.matrix_world.to_3x3() @ normal_local).normalized()
+            return pivot.matrix_world.translation.copy(), normal_world
+    return Vector((0.0, 0.0, 0.0)), Vector((1.0, 0.0, 0.0))
 
 
 class USBEE_OT_draw_seam_curve(Operator):
     """Click on the mesh to place seam points directly on its surface.
     Right-click or Enter finishes an open cut (e.g. a dart); clicking back
-    near the first point closes it into a loop. Esc cancels."""
+    near the first point closes it into a loop. Esc cancels. Clicks near a
+    mesh boundary edge or the model's mirror/symmetry plane snap to it."""
 
     bl_idname = "usbee.draw_seam_curve"
     bl_label = "Draw Seam Curve"
@@ -78,9 +98,9 @@ class USBEE_OT_draw_seam_curve(Operator):
             and context.active_object.type == "MESH"
         )
 
-    def _build_evaluated_bvh(self, context):
-        # Raycast against the fully evaluated (post-modifier) surface - e.g.
-        # a Subdivision Surface result - not the low-poly base cage, so
+    def _build_evaluated_geometry(self, context):
+        # Raycast/snap against the fully evaluated (post-modifier) surface -
+        # e.g. a Subdivision Surface result - not the low-poly base cage, so
         # clicks land on the surface that will actually get flattened.
         depsgraph = context.evaluated_depsgraph_get()
         eval_obj = self.mesh_obj.evaluated_get(depsgraph)
@@ -89,8 +109,13 @@ class USBEE_OT_draw_seam_curve(Operator):
         bm = bmesh.new()
         bm.from_mesh(eval_mesh)
         self.bvh = BVHTree.FromBMesh(bm)
+        self.boundary_edges_local = [
+            (e.verts[0].co.copy(), e.verts[1].co.copy()) for e in bm.edges if len(e.link_faces) == 1
+        ]
         bm.free()
         eval_obj.to_mesh_clear()
+
+        self.mirror_plane_point, self.mirror_plane_normal = _mirror_plane(self.mesh_obj)
 
     def _raycast(self, context, event):
         region = context.region
@@ -103,12 +128,94 @@ class USBEE_OT_draw_seam_curve(Operator):
         local_origin = mat_inv @ ray_origin
         local_dir = (mat_inv.to_3x3() @ ray_dir).normalized()
 
-        location, _normal, face_index, _dist = self.bvh.ray_cast(local_origin, local_dir)
-        if location is None:
-            return None
-        return location, face_index
+        location, _normal, _face_index, _dist = self.bvh.ray_cast(local_origin, local_dir)
+        return location
 
-    def _add_point(self, world_co):
+    def _nearest_point_on_boundary(self, local_co):
+        best_point = None
+        best_dist_sq = None
+        for a, b in self.boundary_edges_local:
+            ab = b - a
+            len_sq = ab.length_squared
+            if len_sq < 1e-12:
+                candidate = a
+            else:
+                t = max(0.0, min(1.0, (local_co - a).dot(ab) / len_sq))
+                candidate = a + ab * t
+            d = (candidate - local_co).length_squared
+            if best_dist_sq is None or d < best_dist_sq:
+                best_dist_sq = d
+                best_point = candidate
+        return best_point
+
+    def _screen_dist(self, context, event, world_co):
+        pos_2d = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, world_co)
+        if pos_2d is None:
+            return None
+        dx = event.mouse_region_x - pos_2d.x
+        dy = event.mouse_region_y - pos_2d.y
+        return (dx * dx + dy * dy) ** 0.5
+
+    def _compute_placement(self, context, event):
+        """Returns a world-space Vector for where a point would land if
+        clicked right now, applying boundary-edge and mirror-plane
+        snapping - or None if the ray misses the mesh entirely."""
+        local_hit = self._raycast(context, event)
+        if local_hit is None:
+            return None
+        world_hit = self.mesh_obj.matrix_world @ local_hit
+
+        boundary_local = self._nearest_point_on_boundary(local_hit)
+        if boundary_local is not None:
+            boundary_world = self.mesh_obj.matrix_world @ boundary_local
+            dist = self._screen_dist(context, event, boundary_world)
+            if dist is not None and dist <= SNAP_PIXEL_RADIUS:
+                return boundary_world
+
+        normal = self.mirror_plane_normal
+        plane_point = self.mirror_plane_point
+        projected = world_hit - normal * (world_hit - plane_point).dot(normal)
+        dist = self._screen_dist(context, event, projected)
+        if dist is not None and dist <= SNAP_PIXEL_RADIUS:
+            return projected
+
+        return world_hit
+
+    def _ensure_preview_object(self, context):
+        if self.preview_obj is not None:
+            return
+        mesh = bpy.data.meshes.new("USBeeSeamPointPreview")
+        bmesh_tmp = bmesh.new()
+        bmesh.ops.create_uvsphere(bmesh_tmp, u_segments=8, v_segments=6, radius=PREVIEW_POINT_RADIUS)
+        bmesh_tmp.to_mesh(mesh)
+        bmesh_tmp.free()
+        self.preview_obj = bpy.data.objects.new("USBeeSeamPointPreview", mesh)
+        self.preview_obj.show_in_front = True
+        self.preview_obj.color = (0.1, 0.6, 1.0, 1.0)
+        mat = bpy.data.materials.get("USBee Seam Preview Point")
+        if mat is None:
+            mat = bpy.data.materials.new("USBee Seam Preview Point")
+            mat.diffuse_color = (0.1, 0.6, 1.0, 1.0)
+        mesh.materials.append(mat)
+        context.scene.collection.objects.link(self.preview_obj)
+
+    def _update_preview(self, context, event):
+        placement = self._compute_placement(context, event)
+        if placement is None:
+            if self.preview_obj is not None:
+                self.preview_obj.hide_viewport = True
+            return
+        self._ensure_preview_object(context)
+        self.preview_obj.hide_viewport = False
+        self.preview_obj.location = placement
+        context.area.tag_redraw()
+
+    def _remove_preview_object(self):
+        if self.preview_obj is not None:
+            bpy.data.objects.remove(self.preview_obj, do_unlink=True)
+            self.preview_obj = None
+
+    def _add_point(self, world_co, context):
         spline = self.curve_obj.data.splines[0]
         if self.num_points == 0:
             pass  # spline already has its one default point
@@ -117,7 +224,7 @@ class USBEE_OT_draw_seam_curve(Operator):
         spline.points[-1].co = (world_co.x, world_co.y, world_co.z, 1.0)
         self.num_points += 1
         self.last_world_co = world_co.copy()
-        self._update_header(context_area=self._area)
+        self._update_header(context.area)
 
     def _update_header(self, context_area):
         context_area.header_text_set(
@@ -126,6 +233,7 @@ class USBEE_OT_draw_seam_curve(Operator):
         )
 
     def _finish(self, context, cyclic):
+        self._remove_preview_object()
         self.curve_obj.data.splines[0].use_cyclic_u = cyclic
         for entry in self.mesh_obj.usbee_pieces:
             entry.flatten_dirty = True
@@ -135,6 +243,7 @@ class USBEE_OT_draw_seam_curve(Operator):
         )
 
     def _cancel(self, context):
+        self._remove_preview_object()
         context.area.header_text_set(None)
         bpy.data.objects.remove(self.curve_obj, do_unlink=True)
 
@@ -142,8 +251,8 @@ class USBEE_OT_draw_seam_curve(Operator):
         self.mesh_obj = context.active_object
         self.num_points = 0
         self.last_world_co = None
-        self._area = context.area
-        self._build_evaluated_bvh(context)
+        self.preview_obj = None
+        self._build_evaluated_geometry(context)
 
         curve_data = bpy.data.curves.new(name="SeamCurve", type="CURVE")
         curve_data.dimensions = "3D"
@@ -152,13 +261,18 @@ class USBEE_OT_draw_seam_curve(Operator):
         self.curve_obj[SOURCE_OBJECT_PROP] = self.mesh_obj.name
         _get_or_create_collection(context).objects.link(self.curve_obj)
         _make_seam_curve_visible(self.curve_obj)
-        _add_shrinkwrap(self.curve_obj, self.mesh_obj)
+        _add_surface_follow(self.curve_obj, self.mesh_obj)
 
         self._update_header(context.area)
+        self._update_preview(context, event)
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
+        if event.type == "MOUSEMOVE":
+            self._update_preview(context, event)
+            return {"RUNNING_MODAL"}
+
         if event.type == "LEFTMOUSE" and event.value == "PRESS":
             if self.num_points >= 3:
                 first_2d = view3d_utils.location_3d_to_region_2d(
@@ -171,12 +285,10 @@ class USBEE_OT_draw_seam_curve(Operator):
                         self._finish(context, cyclic=True)
                         return {"FINISHED"}
 
-            hit = self._raycast(context, event)
-            if hit is not None:
-                local_co, _face_index = hit
-                world_co = self.mesh_obj.matrix_world @ local_co
-                if self.last_world_co is None or (world_co - self.last_world_co).length > MIN_POINT_SPACING:
-                    self._add_point(world_co)
+            placement = self._compute_placement(context, event)
+            if placement is not None:
+                if self.last_world_co is None or (placement - self.last_world_co).length > MIN_POINT_SPACING:
+                    self._add_point(placement, context)
             return {"RUNNING_MODAL"}
 
         if event.type in {"RIGHTMOUSE", "RET", "NUMPAD_ENTER"} and event.value == "PRESS":
@@ -202,7 +314,8 @@ class USBEE_OT_add_seam_curve(Operator):
     """Add a blank seam curve near the active mesh for manual shaping with
     Blender's normal curve tools (Tab into edit mode, extrude/move points) -
     an alternative to 'Draw Seam Curve' for precise manual control. A
-    Shrinkwrap modifier keeps it glued to the surface as you move points."""
+    surface-follow modifier keeps it glued to the surface as you move
+    points."""
 
     bl_idname = "usbee.add_seam_curve"
     bl_label = "Add Blank Seam Curve"
@@ -221,8 +334,8 @@ class USBEE_OT_add_seam_curve(Operator):
         spline.points.add(1)  # POLY splines start with 1 point; add 1 more -> 2 total
 
         # Seed two points near the mesh's origin so there's something
-        # immediately visible/selectable to edit; the Shrinkwrap modifier
-        # will pull them onto the surface once bound below.
+        # immediately visible/selectable to edit; the surface-follow
+        # modifier will pull them onto the surface once bound below.
         center = mesh_obj.matrix_world.translation
         spline.points[0].co = (center.x - 0.05, center.y, center.z, 1.0)
         spline.points[1].co = (center.x + 0.05, center.y, center.z, 1.0)
@@ -233,7 +346,7 @@ class USBEE_OT_add_seam_curve(Operator):
         coll = _get_or_create_collection(context)
         coll.objects.link(curve_obj)
         _make_seam_curve_visible(curve_obj)
-        _add_shrinkwrap(curve_obj, mesh_obj)
+        _add_surface_follow(curve_obj, mesh_obj)
 
         context.view_layer.objects.active = curve_obj
         for obj in context.selected_objects:
