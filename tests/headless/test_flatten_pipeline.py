@@ -218,11 +218,13 @@ def test_partial_rebake_only_touches_edited_piece():
     big_obj_before = bpy.data.objects[big_flat_name_before]
     big_loc_before = big_obj_before.location.copy()
 
-    # Shrink the seam curve further, changing only the small piece's shape.
-    from bl_ext.user_default.usbee.geometry import seam_points as seam_points_mod
-
-    points, closed = seam_points_mod.load_points(curve_obj)
-    seam_points_mod.store_points(curve_obj, [centroid + (p - centroid) * 0.9 for p in points], closed)
+    # Shrink the seam curve further, changing only the small piece's shape -
+    # directly edit the skeleton mesh's vertex data, the way native Edit
+    # Mode would. curve_obj has an identity transform (see
+    # create_seam_curve_object), so its local vertex coords are world-space.
+    for v in curve_obj.data.vertices:
+        v.co = centroid + (v.co - centroid) * 0.9
+    curve_obj.data.update()
     bpy.context.view_layer.objects.active = mesh_obj
 
     mesh_obj.usbee_active_piece_index = list(mesh_obj.usbee_pieces).index(small_piece)
@@ -282,7 +284,11 @@ def test_seam_curve_tube_hugs_surface():
         mesh_obj, [Vector((-0.9, 0.0, 0.4)), Vector((0.9, 0.0, 0.4))], cyclic=False
     )
 
-    verts = [tuple(v.co) for v in curve_obj.data.vertices]
+    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+
+    tube_obj = seam_curve_ops._tube_object_for(curve_obj)
+    assert tube_obj is not None, "expected a display tube companion object"
+    verts = [tuple(v.co) for v in tube_obj.data.vertices]
     assert len(verts) > 20, (
         f"expected the display tube to be resampled into many points to "
         f"hug the surface, got only {len(verts)} raw vertices"
@@ -327,7 +333,11 @@ def test_seam_curve_mirror_bias_no_zigzag():
         base, [Vector((0.0, -0.9, 0.3)), Vector((0.0, 0.9, 0.3))], cyclic=False
     )
 
-    xs = [v.co.x for v in curve_obj.data.vertices]
+    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+
+    tube_obj = seam_curve_ops._tube_object_for(curve_obj)
+    assert tube_obj is not None, "expected a display tube companion object"
+    xs = [v.co.x for v in tube_obj.data.vertices]
     signs = {1 if x > 1e-6 else (-1 if x < -1e-6 else 0) for x in xs}
     assert signs != {1, -1}, (
         f"tube crosses back and forth across the mirror plane (x values on "
@@ -336,7 +346,7 @@ def test_seam_curve_mirror_bias_no_zigzag():
     )
 
 
-@test("mirroring a seam curve reflects its points across the mesh's mirror plane")
+@test("usbee.mirror_seam_curve adds a Mirror modifier matching the source mesh's plane")
 def test_mirror_seam_curve_operator():
     _clean_scene()
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=24, ring_count=12)
@@ -356,18 +366,23 @@ def test_mirror_seam_curve_operator():
     result = bpy.ops.usbee.mirror_seam_curve()
     assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
 
-    mirrored = bpy.context.active_object
-    assert mirrored is not curve_obj, "expected a new, separate object"
-    assert mirrored.get("usbee_seam_source_object") == mesh_obj.name
+    mods = [m for m in curve_obj.modifiers if m.type == "MIRROR"]
+    assert len(mods) == 1, f"expected exactly one Mirror modifier, got {len(mods)}"
+    assert tuple(mods[0].use_axis) == (True, False, False), "should match the source mesh's mirror axis"
 
-    from bl_ext.user_default.usbee.geometry import seam_points as seam_points_mod
+    from bl_ext.user_default.usbee.geometry import curve_display
 
-    mirrored_points, _closed = seam_points_mod.load_points(mirrored)
-    assert len(mirrored_points) == len(original_points)
-    for orig, mirr in zip(original_points, mirrored_points):
-        assert abs(orig.x + mirr.x) < 1e-6, f"expected x reflected across 0: {orig.x} vs {mirr.x}"
-        assert abs(orig.y - mirr.y) < 1e-6, "y should be unchanged by an x-axis mirror"
-        assert abs(orig.z - mirr.z) < 1e-6, "z should be unchanged by an x-axis mirror"
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    verts, edges = curve_display.evaluated_skeleton_geometry(curve_obj, depsgraph)
+    assert len(verts) == 2 * len(original_points), (
+        f"expected the Mirror modifier to double the point count, got {len(verts)} from {len(original_points)}"
+    )
+    xs = sorted(v.x for v in verts)
+    assert xs[0] < 0 < xs[-1], "expected points on both sides of the mirror plane after evaluation"
+
+    # Re-running should be a no-op, not stack a second Mirror modifier.
+    assert bpy.ops.usbee.mirror_seam_curve() == {"FINISHED"}
+    assert len([m for m in curve_obj.modifiers if m.type == "MIRROR"]) == 1
 
 
 @test("a new seam curve can snap to segments of an already-drawn one on the same mesh")
@@ -388,11 +403,11 @@ def test_snap_to_other_seam_curve_segments():
 
     from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
 
-    segments = seam_curve_ops._other_seam_curve_segments(mesh_obj, exclude_curve_obj=new_curve)
+    segments = seam_curve_ops._other_seam_curve_segments(bpy.context, mesh_obj, exclude_curve_obj=new_curve)
     assert len(segments) == 1, f"expected exactly 1 segment from the other curve, got {len(segments)}"
 
     segments_excluding_existing = seam_curve_ops._other_seam_curve_segments(
-        mesh_obj, exclude_curve_obj=existing_curve
+        bpy.context, mesh_obj, exclude_curve_obj=existing_curve
     )
     assert len(segments_excluding_existing) == 1, "expected to find new_curve's segment instead"
 

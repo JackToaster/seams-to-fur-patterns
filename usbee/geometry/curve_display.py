@@ -1,18 +1,23 @@
-"""Pure-Python seam curve display: resamples the raw authored point list,
-projects each resampled point onto the target mesh's surface, and builds a
-simple tube mesh around the result - directly into the seam curve object's
-own Mesh datablock.
+"""Pure-Python seam curve display: reads a seam curve skeleton object's
+*evaluated* geometry (respecting whatever modifiers - Mirror, Array,
+whatever - the user has added to it directly), resamples each edge,
+projects the resampled points onto the target mesh's surface, and builds a
+simple tube mesh around the result into a separate display object.
 
-Deliberately no modifiers, no Curve object type, no Geometry Nodes: this
-addon fully owns seam-curve geometry end to end, because both of the
-"let Blender do it" alternatives turned out to be unreliable in practice -
-a classic Mirror modifier doesn't reliably preserve curve-domain data when
-applied to a Curve object (it behaves like it rasterizes toward mesh
-output), and a curve whose display comes from a modifier/GN stack can't be
-edited via native curve Edit Mode without the two fighting each other. With
-plain Python + bmesh, "hugging the surface" and "mirroring the seam" are
-both just vector math we control completely, and the result is always a
-plain mesh with no stack to reason about.
+The skeleton itself is a plain Mesh (vertices + edges, no faces) that the
+addon never adds modifiers to and never locks out of native Edit Mode -
+see operators.seam_curve's module docstring for why: Mirror/Array on a
+Mesh is one of Blender's most standard, reliable modifier use cases (it
+was specifically Curve objects where Mirror behaved like it rasterized
+toward mesh output), and native mesh Edit Mode (move/extrude/merge/delete
+vertices) is exactly the tool a user should be able to rely on for
+touching up points after the fact.
+
+The tube itself still can't be a modifier on the skeleton - stacking our
+own modifier there would reintroduce the exact ordering fragility this
+design avoids by not adding any modifier of our own at all - so it's a
+separate object we regenerate in plain Python/bmesh whenever the skeleton
+(or its modifiers) change.
 """
 
 import math
@@ -43,43 +48,42 @@ def segment_length_for(mesh_obj):
     return max(mesh_obj.dimensions) * 0.02 or 0.02
 
 
-def resample_polyline(points, closed, segment_length):
-    """Arc-length resample of a polyline (list of Vector, world space) to
-    roughly even spacing of segment_length. Denser sampling makes the
-    surface-projection step below hug curvature instead of a straight
-    chord cutting through the interior between sparse authored points."""
-    pts = list(points)
-    if len(pts) < 2:
-        return pts
-    if closed:
-        pts = pts + [pts[0]]
+def evaluated_skeleton_geometry(curve_obj, depsgraph):
+    """Returns (verts: list[Vector] world space, edges: list[(int, int)])
+    from the skeleton object's *evaluated* geometry - i.e. after any
+    Mirror/Array/etc. modifiers the user added directly to it. Only edges
+    are read (ignoring any faces some modifier might incidentally add), so
+    this is robust to whatever's in the modifier stack.
+    """
+    eval_obj = curve_obj.evaluated_get(depsgraph)
+    eval_mesh = eval_obj.to_mesh()
+    mat = curve_obj.matrix_world
+    verts = [mat @ v.co for v in eval_mesh.vertices]
+    edges = [tuple(e.vertices) for e in eval_mesh.edges]
+    eval_obj.to_mesh_clear()
+    return verts, edges
 
-    total_length = sum((pts[i + 1] - pts[i]).length for i in range(len(pts) - 1))
-    if total_length < 1e-9:
-        return list(points)
 
-    n_segments = max(1, round(total_length / segment_length))
-    step = total_length / n_segments
-
-    result = [pts[0]]
-    accumulated = 0.0
-    next_target = step
-    max_points = n_segments if closed else n_segments + 1
-    for i in range(len(pts) - 1):
-        a, b = pts[i], pts[i + 1]
-        seg_vec = b - a
-        seg_len = seg_vec.length
-        seg_start = accumulated
-        seg_end = accumulated + seg_len
-        while next_target <= seg_end + 1e-9 and len(result) < max_points:
-            t = (next_target - seg_start) / seg_len if seg_len > 1e-12 else 0.0
-            result.append(a + seg_vec * t)
-            next_target += step
-        accumulated = seg_end
-
-    if not closed and (result[-1] - pts[-1]).length > 1e-6:
-        result.append(pts[-1])
-    return result
+def resample_edges(verts, edges, segment_length):
+    """Subdivides each edge independently into ~segment_length-long pieces.
+    Edge-wise (not chain-traced) so this works for any topology a user
+    might build in Edit Mode - open paths, loops, branches, multiple
+    disconnected pieces - without needing to trace connected chains.
+    Returns a new (verts, edges) pair.
+    """
+    new_verts = []
+    new_edges = []
+    for a_idx, b_idx in edges:
+        a, b = verts[a_idx], verts[b_idx]
+        length = (b - a).length
+        n_segments = max(1, round(length / segment_length))
+        start = len(new_verts)
+        for i in range(n_segments + 1):
+            t = i / n_segments
+            new_verts.append(a + (b - a) * t)
+        for i in range(n_segments):
+            new_edges.append((start + i, start + i + 1))
+    return new_verts, new_edges
 
 
 def project_onto_surface(points, bvh, mesh_obj, bias_world=None):
@@ -116,27 +120,39 @@ def mirror_bias(mesh_obj, segment_length, mirror_normal_world, has_real_mirror):
     return mirror_normal_world * (segment_length * 0.25)
 
 
-def build_tube_mesh(mesh_data, points, closed, radius=TUBE_RADIUS, ring_segments=RING_SEGMENTS):
-    """Writes a tube mesh hugging `points` (world space) into mesh_data."""
+def build_tube_mesh(mesh_data, verts, edges, radius=TUBE_RADIUS, ring_segments=RING_SEGMENTS):
+    """Writes a tube mesh hugging (verts, edges) (world space) into
+    mesh_data - one ring per vertex, one quad strip per edge. Works for
+    arbitrary topology (open paths, loops, branches) since it only needs
+    per-vertex tangents and per-edge connectivity, not an ordered chain."""
     bm = bmesh.new()
-    n = len(points)
-    if n < 2:
+    n = len(verts)
+    if n < 2 or not edges:
         bm.to_mesh(mesh_data)
         bm.free()
         mesh_data.update()
         return
 
+    neighbors = {}
+    for a, b in edges:
+        neighbors.setdefault(a, []).append(b)
+        neighbors.setdefault(b, []).append(a)
+
     def tangent_at(i):
-        if closed:
-            prev_p, next_p = points[(i - 1) % n], points[(i + 1) % n]
+        nbrs = neighbors.get(i)
+        if not nbrs:
+            return Vector((0.0, 0.0, 1.0))
+        if len(nbrs) == 1:
+            d = verts[i] - verts[nbrs[0]]
         else:
-            prev_p, next_p = points[max(i - 1, 0)], points[min(i + 1, n - 1)]
-        d = next_p - prev_p
+            d = verts[nbrs[0]] - verts[nbrs[-1]]
         return d.normalized() if d.length > 1e-9 else Vector((0.0, 0.0, 1.0))
 
-    rings = []
+    rings = {}
     for i in range(n):
-        p = points[i]
+        if i not in neighbors:
+            continue
+        p = verts[i]
         t = tangent_at(i)
         # Not parallel-transported between rings, so a long, twisty curve
         # can show a little visual twist in the tube - acceptable for a
@@ -144,7 +160,7 @@ def build_tube_mesh(mesh_data, points, closed, radius=TUBE_RADIUS, ring_segments
         ref = Vector((0.0, 0.0, 1.0)) if abs(t.z) < 0.9 else Vector((1.0, 0.0, 0.0))
         side1 = t.cross(ref).normalized()
         side2 = t.cross(side1).normalized()
-        ring = [
+        rings[i] = [
             bm.verts.new(
                 p
                 + side1 * math.cos(2 * math.pi * k / ring_segments) * radius
@@ -152,20 +168,14 @@ def build_tube_mesh(mesh_data, points, closed, radius=TUBE_RADIUS, ring_segments
             )
             for k in range(ring_segments)
         ]
-        rings.append(ring)
 
     bm.verts.ensure_lookup_table()
 
-    ring_pairs = n if closed else n - 1
-    for i in range(ring_pairs):
-        ring_a, ring_b = rings[i], rings[(i + 1) % n]
+    for a, b in edges:
+        ring_a, ring_b = rings[a], rings[b]
         for k in range(ring_segments):
             k2 = (k + 1) % ring_segments
             bm.faces.new((ring_a[k], ring_a[k2], ring_b[k2], ring_b[k]))
-
-    if not closed:
-        bm.faces.new(rings[0][::-1])
-        bm.faces.new(rings[-1])
 
     bm.normal_update()
     bm.to_mesh(mesh_data)
@@ -173,18 +183,9 @@ def build_tube_mesh(mesh_data, points, closed, radius=TUBE_RADIUS, ring_segments
     mesh_data.update()
 
 
-def rebuild_display(mesh_data, points_world, closed, mesh_obj, bvh, bias_world=None):
-    """Full pipeline: resample -> project onto surface -> tube mesh."""
+def rebuild_display(mesh_data, skeleton_verts, skeleton_edges, mesh_obj, bvh, bias_world=None):
+    """Full pipeline: resample skeleton edges -> project onto surface -> tube mesh."""
     segment_length = segment_length_for(mesh_obj)
-    resampled = resample_polyline(points_world, closed, segment_length)
-    projected = project_onto_surface(resampled, bvh, mesh_obj, bias_world=bias_world)
-    build_tube_mesh(mesh_data, projected, closed)
-
-
-def mirror_points(points, plane_point, plane_normal):
-    """Reflects each point across the given plane."""
-    result = []
-    for p in points:
-        d = (p - plane_point).dot(plane_normal)
-        result.append(p - plane_normal * (2.0 * d))
-    return result
+    resampled_verts, resampled_edges = resample_edges(skeleton_verts, skeleton_edges, segment_length)
+    projected = project_onto_surface(resampled_verts, bvh, mesh_obj, bias_world=bias_world)
+    build_tube_mesh(mesh_data, projected, resampled_edges)

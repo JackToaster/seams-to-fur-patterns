@@ -50,10 +50,13 @@ class USBEE_PT_main(Panel):
 
         source_name = obj.get(SOURCE_OBJECT_PROP)
         if source_name is not None:
-            # The active object is itself a seam curve, not the source mesh.
-            layout.label(text=f"Seam curve for '{source_name}'", icon="CURVE_DATA")
-            layout.operator("usbee.edit_seam_curve", icon="MOD_EDGESPLIT", text="Edit Seam Curve")
+            # The active object is itself a seam curve skeleton, not the
+            # source mesh - Tab into Edit Mode to move/extrude/merge/delete
+            # its points directly, and add modifiers (Mirror, Array, ...)
+            # via the normal Modifier Properties panel.
+            layout.label(text=f"Seam curve for '{source_name}'", icon="MESH_DATA")
             layout.operator("usbee.mirror_seam_curve", icon="MOD_MIRROR", text="Mirror Seam Curve")
+            layout.operator("usbee.refresh_seam_display", icon="FILE_REFRESH", text="Refresh Display")
             return
 
         if obj.type != "MESH":

@@ -1,16 +1,21 @@
 """Seam curve resolution to mesh edges, and island isolation.
 
-Phase 1 scope: seam curves are resolved to mesh seam edges by snapping each
-authored point (see geometry.seam_points) to its nearest mesh vertex and
-walking a shortest edge path between consecutive snapped points. This is a
-deliberate scope reduction from true continuous curve-to-mesh bisection
-(see plan) - it keeps seam curves editable without requiring users to pick
-existing edges, while avoiding the much harder arbitrary-line mesh-cutting
-problem.
+Phase 1 scope: a seam curve is a skeleton Mesh object (vertices + edges, no
+faces - see operators.seam_curve and geometry.curve_display for why).
+Resolution reads its *evaluated* geometry (respecting any Mirror/Array/etc.
+modifiers the user added directly to it) and, independently for each edge,
+snaps both endpoints to their nearest mesh vertex and walks a shortest edge
+path between them. This is a deliberate scope reduction from true
+continuous curve-to-mesh bisection (see plan) - it keeps seams editable
+without requiring users to pick existing edges, while avoiding the much
+harder arbitrary-line mesh-cutting problem. Working edge-by-edge rather
+than tracing an ordered chain means this handles any topology a user might
+build in Edit Mode - open paths, loops, branches, multiple pieces - without
+needing to know which.
 
-Resolution always re-reads the curve's stored points fresh (no separate
-"bind" step or cache): it's cheap (seam curves have few points), and
-correctness only ever depends on whatever the user last edited them to.
+Resolution always re-evaluates the curve fresh (no separate "bind" step or
+cache): it's cheap (seam curves have few points), and correctness only
+ever depends on whatever the user last edited them (or their modifiers) to.
 
 The scene mesh is never mutated by anything in this module; callers pass an
 evaluated BMesh copy.
@@ -19,7 +24,9 @@ evaluated BMesh copy.
 import heapq
 import uuid as uuid_mod
 
-from . import seam_points
+import bpy
+
+from . import curve_display
 
 
 class TopologyError(Exception):
@@ -79,21 +86,25 @@ def _shortest_edge_path(bm, start_vert, end_vert):
 
 
 def resolve_curve_seam_edges(bm, curve_obj, mesh_obj):
-    """Resolve a seam curve to a set of bmesh edge indices on bm, by
-    re-reading its stored points fresh every call (see module docstring)."""
-    points, closed = seam_points.load_points(curve_obj)
-    if len(points) < 2:
-        raise TopologyError(f"Seam curve '{curve_obj.name}' needs at least 2 points")
+    """Resolve a seam curve skeleton to a set of bmesh edge indices on bm,
+    by evaluating its current geometry fresh every call (see module
+    docstring) - respecting any Mirror/Array/etc. modifiers on it."""
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    verts, edges = curve_display.evaluated_skeleton_geometry(curve_obj, depsgraph)
+    if len(edges) < 1:
+        raise TopologyError(f"Seam curve '{curve_obj.name}' needs at least one edge")
 
     to_mesh_local = mesh_obj.matrix_world.inverted()
-    snapped_verts = [_nearest_vert_on_mesh(bm, to_mesh_local @ p) for p in points]
+    snapped = {}
 
-    pairs = list(zip(snapped_verts, snapped_verts[1:]))
-    if closed and len(snapped_verts) > 2:
-        pairs.append((snapped_verts[-1], snapped_verts[0]))
+    def snapped_vert(i):
+        if i not in snapped:
+            snapped[i] = _nearest_vert_on_mesh(bm, to_mesh_local @ verts[i])
+        return snapped[i]
 
     seam_edges = set()
-    for a, b in pairs:
+    for a_idx, b_idx in edges:
+        a, b = snapped_vert(a_idx), snapped_vert(b_idx)
         path = _shortest_edge_path(bm, a, b)
         if path is None:
             raise TopologyError(
