@@ -2,6 +2,7 @@ import bpy
 from bpy.types import Panel, UIList
 
 from ..backends import bff
+from ..operators.seam_curve import SOURCE_OBJECT_PROP
 
 
 class USBEE_UL_pieces(UIList):
@@ -43,12 +44,23 @@ class USBEE_PT_main(Panel):
             row.label(text="Flattening backend missing", icon="ERROR")
             box.label(text="See Preferences > Add-ons > USBee", icon="INFO")
 
-        if obj is None or obj.type != "MESH":
+        if obj is None:
+            layout.label(text="Select a mesh object", icon="INFO")
+            return
+
+        source_name = obj.get(SOURCE_OBJECT_PROP)
+        if source_name is not None:
+            # The active object is itself a seam curve, not the source mesh.
+            layout.label(text=f"Seam curve for '{source_name}'", icon="CURVE_DATA")
+            layout.operator("usbee.edit_seam_curve", icon="MOD_EDGESPLIT", text="Edit Seam Curve")
+            layout.operator("usbee.mirror_seam_curve", icon="MOD_MIRROR", text="Mirror Seam Curve")
+            return
+
+        if obj.type != "MESH":
             layout.label(text="Select a mesh object", icon="INFO")
             return
 
         layout.operator("usbee.draw_seam_curve", icon="GREASEPENCIL", text="Draw Seam Curve")
-        layout.operator("usbee.add_seam_curve", icon="CURVE_DATA", text="Add Blank Seam Curve")
 
         settings_box = layout.box()
         settings_box.prop(obj, "usbee_thickness_mm")

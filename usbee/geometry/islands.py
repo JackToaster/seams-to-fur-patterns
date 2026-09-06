@@ -1,17 +1,16 @@
 """Seam curve resolution to mesh edges, and island isolation.
 
-Phase 1 scope: seam curves are resolved to mesh seam edges by evaluating the
-curve's live (post-modifier) geometry - so a Shrinkwrap keeping it glued to
-the surface, or Array/Mirror duplicating it, are respected automatically -
-then snapping each resulting point to its nearest mesh vertex and walking a
-shortest edge path between consecutive snapped points. This is a deliberate
-scope reduction from true continuous curve-to-mesh bisection (see plan) - it
-keeps seam curves editable without requiring users to pick existing edges,
-while avoiding the much harder arbitrary-line mesh-cutting problem.
+Phase 1 scope: seam curves are resolved to mesh seam edges by snapping each
+authored point (see geometry.seam_points) to its nearest mesh vertex and
+walking a shortest edge path between consecutive snapped points. This is a
+deliberate scope reduction from true continuous curve-to-mesh bisection
+(see plan) - it keeps seam curves editable without requiring users to pick
+existing edges, while avoiding the much harder arbitrary-line mesh-cutting
+problem.
 
-Resolution always re-evaluates the curve fresh (no separate "bind" step or
-cache): correctness with live modifiers requires it, and it's cheap enough
-(seam curves have few points) to not need caching in Phase 1.
+Resolution always re-reads the curve's stored points fresh (no separate
+"bind" step or cache): it's cheap (seam curves have few points), and
+correctness only ever depends on whatever the user last edited them to.
 
 The scene mesh is never mutated by anything in this module; callers pass an
 evaluated BMesh copy.
@@ -20,95 +19,11 @@ evaluated BMesh copy.
 import heapq
 import uuid as uuid_mod
 
-import bpy
-
-from . import curve_display
+from . import seam_points
 
 
 class TopologyError(Exception):
     """Raised when an island isn't valid disk topology for flattening."""
-
-
-def _extract_curve_chains(curve_obj, depsgraph):
-    """Evaluate curve_obj (with modifiers applied) and return a list of
-    (is_closed, [Vector, ...]) chains in the curve object's local space -
-    one chain per resulting spline, so Array/Mirror modifiers that produce
-    multiple loops/paths from one source spline are all included.
-
-    The "USBee Surface Follow" geometry-nodes modifier (visual tube; see
-    geometry.curve_display) turns to_mesh() into a tube surface instead of a
-    plain polyline, which would corrupt path extraction below - temporarily
-    disable it for this evaluation only, then restore, so display and
-    resolution don't conflict. Any *other* modifiers (Array, Mirror, etc.)
-    stay active, since those should affect the resolved cut.
-    """
-    was_enabled = curve_display.set_modifier_enabled(curve_obj, False)
-    depsgraph.update()
-    try:
-        eval_obj = curve_obj.evaluated_get(depsgraph)
-        eval_mesh = eval_obj.to_mesh()
-
-        verts = [v.co.copy() for v in eval_mesh.vertices]
-        adjacency = {}
-        for e in eval_mesh.edges:
-            a, b = e.vertices[0], e.vertices[1]
-            adjacency.setdefault(a, []).append(b)
-            adjacency.setdefault(b, []).append(a)
-
-        eval_obj.to_mesh_clear()
-    finally:
-        if was_enabled is not None:
-            curve_display.set_modifier_enabled(curve_obj, was_enabled)
-        depsgraph.update()
-
-    def edge_key(a, b):
-        return (a, b) if a < b else (b, a)
-
-    visited_edges = set()
-    chains = []
-
-    # Open chains: walk from each degree-1 vertex to its other end.
-    endpoints = [v for v, nbrs in adjacency.items() if len(nbrs) == 1]
-    for start in endpoints:
-        if edge_key(start, adjacency[start][0]) in visited_edges:
-            continue
-        chain_indices = [start]
-        current = start
-        while True:
-            next_v = next(
-                (n for n in adjacency[current] if edge_key(current, n) not in visited_edges),
-                None,
-            )
-            if next_v is None:
-                break
-            visited_edges.add(edge_key(current, next_v))
-            chain_indices.append(next_v)
-            current = next_v
-        chains.append((False, [verts[i] for i in chain_indices]))
-
-    # Closed loops: any vertices with remaining unvisited edges are cycles
-    # (everything of degree 1 was already consumed by the open-chain pass).
-    for start in adjacency:
-        remaining = [n for n in adjacency[start] if edge_key(start, n) not in visited_edges]
-        if not remaining:
-            continue
-        chain_indices = [start]
-        current = start
-        while True:
-            next_v = next(
-                (n for n in adjacency[current] if edge_key(current, n) not in visited_edges),
-                None,
-            )
-            if next_v is None:
-                break
-            visited_edges.add(edge_key(current, next_v))
-            if next_v == start:
-                break
-            chain_indices.append(next_v)
-            current = next_v
-        chains.append((True, [verts[i] for i in chain_indices]))
-
-    return chains
 
 
 def _nearest_vert_on_mesh(bm, local_co):
@@ -164,38 +79,29 @@ def _shortest_edge_path(bm, start_vert, end_vert):
 
 
 def resolve_curve_seam_edges(bm, curve_obj, mesh_obj):
-    """Resolve a seam curve to a set of bmesh edge indices on bm.
+    """Resolve a seam curve to a set of bmesh edge indices on bm, by
+    re-reading its stored points fresh every call (see module docstring)."""
+    points, closed = seam_points.load_points(curve_obj)
+    if len(points) < 2:
+        raise TopologyError(f"Seam curve '{curve_obj.name}' needs at least 2 points")
 
-    Evaluates curve_obj fresh (through its modifier stack) every call, so a
-    Shrinkwrap keeping it glued to the surface or an Array/Mirror producing
-    extra copies are always respected - see module docstring.
-    """
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    chains = _extract_curve_chains(curve_obj, depsgraph)
-    if not chains:
-        raise TopologyError(f"Seam curve '{curve_obj.name}' has no points")
+    to_mesh_local = mesh_obj.matrix_world.inverted()
+    snapped_verts = [_nearest_vert_on_mesh(bm, to_mesh_local @ p) for p in points]
 
-    to_mesh_local = mesh_obj.matrix_world.inverted() @ curve_obj.matrix_world
+    pairs = list(zip(snapped_verts, snapped_verts[1:]))
+    if closed and len(snapped_verts) > 2:
+        pairs.append((snapped_verts[-1], snapped_verts[0]))
 
     seam_edges = set()
-    for is_closed, points in chains:
-        if len(points) < 2:
-            continue
-        snapped_verts = [_nearest_vert_on_mesh(bm, to_mesh_local @ p) for p in points]
-
-        pairs = list(zip(snapped_verts, snapped_verts[1:]))
-        if is_closed and len(snapped_verts) > 2:
-            pairs.append((snapped_verts[-1], snapped_verts[0]))
-
-        for a, b in pairs:
-            path = _shortest_edge_path(bm, a, b)
-            if path is None:
-                raise TopologyError(
-                    f"Seam curve '{curve_obj.name}' has points that resolve to "
-                    f"disconnected regions of the mesh"
-                )
-            for e in path:
-                seam_edges.add(e.index)
+    for a, b in pairs:
+        path = _shortest_edge_path(bm, a, b)
+        if path is None:
+            raise TopologyError(
+                f"Seam curve '{curve_obj.name}' has points that resolve to "
+                f"disconnected regions of the mesh"
+            )
+        for e in path:
+            seam_edges.add(e.index)
 
     return seam_edges
 

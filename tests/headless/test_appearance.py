@@ -80,14 +80,9 @@ def test_sync_piece_colors_two_pieces():
     centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
     shrunk = [centroid + (p - centroid) * 0.8 for p in world_pts]
 
-    bpy.context.view_layer.objects.active = mesh_obj
-    bpy.ops.usbee.add_seam_curve()
-    curve_obj = bpy.context.active_object
-    spline = curve_obj.data.splines[0]
-    spline.points.add(len(shrunk) - len(spline.points))
-    for i, p in enumerate(shrunk):
-        spline.points[i].co = (p.x, p.y, p.z, 1.0)
-    spline.use_cyclic_u = True
+    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+
+    seam_curve_ops.create_seam_curve_object(bpy.context, mesh_obj, shrunk, closed=True)
 
     bpy.context.view_layer.objects.active = mesh_obj
     assert bpy.ops.usbee.flatten_all() == {"FINISHED"}

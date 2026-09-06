@@ -12,7 +12,6 @@ there's nothing binary to keep in sync with the addon's schema.
 import sys
 import traceback
 
-import bmesh
 import bpy
 import mathutils
 
@@ -37,15 +36,9 @@ def _clean_scene():
 
 
 def _add_seam_curve_for(mesh_obj, world_points, cyclic=True):
-    bpy.context.view_layer.objects.active = mesh_obj
-    bpy.ops.usbee.add_seam_curve()
-    curve_obj = bpy.context.active_object
-    spline = curve_obj.data.splines[0]
-    spline.points.add(len(world_points) - len(spline.points))
-    for i, p in enumerate(world_points):
-        spline.points[i].co = (p.x, p.y, p.z, 1.0)
-    spline.use_cyclic_u = cyclic
-    return curve_obj
+    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+
+    return seam_curve_ops.create_seam_curve_object(bpy.context, mesh_obj, list(world_points), cyclic)
 
 
 @test("island isolation: single seam loop on a cube splits it into 2 islands")
@@ -122,7 +115,6 @@ def test_closed_mesh_rejected():
 @test("BFF sanity: flattening an already-flat mesh is close to identity in area")
 def test_bff_already_flat_mesh():
     from bl_ext.user_default.usbee.backends import bff as bff_backend
-    from bl_ext.user_default.usbee.geometry import obj_io
     import os
 
     addon_dir = os.path.dirname(os.path.dirname(bff_backend.__file__))
@@ -227,15 +219,10 @@ def test_partial_rebake_only_touches_edited_piece():
     big_loc_before = big_obj_before.location.copy()
 
     # Shrink the seam curve further, changing only the small piece's shape.
-    spline = curve_obj.data.splines[0]
-    for i, p in enumerate(spline.points):
-        co = p.co
-        p.co = (
-            centroid.x + (co.x - centroid.x) * 0.9,
-            centroid.y + (co.y - centroid.y) * 0.9,
-            centroid.z + (co.z - centroid.z) * 0.9,
-            1.0,
-        )
+    from bl_ext.user_default.usbee.geometry import seam_points as seam_points_mod
+
+    points, closed = seam_points_mod.load_points(curve_obj)
+    seam_points_mod.store_points(curve_obj, [centroid + (p - centroid) * 0.9 for p in points], closed)
     bpy.context.view_layer.objects.active = mesh_obj
 
     mesh_obj.usbee_active_piece_index = list(mesh_obj.usbee_pieces).index(small_piece)
@@ -256,15 +243,12 @@ def test_open_dart_curve_splits_vertices():
     base_vert_count = len(mesh_obj.data.vertices)
     base_face_count = len(mesh_obj.data.polygons)
 
-    bpy.context.view_layer.objects.active = mesh_obj
-    bpy.ops.usbee.add_seam_curve()
-    curve_obj = bpy.context.active_object
-    spline = curve_obj.data.splines[0]
     # Starts at the mesh boundary (x=-1), ends at an interior point (the
-    # dart tip) - deliberately NOT cyclic, i.e. an open cut, not a loop.
-    spline.points[0].co = (-1.0, 0.0, 0.0, 1.0)
-    spline.points[1].co = (-0.3, 0.0, 0.0, 1.0)
-    spline.use_cyclic_u = False
+    # dart tip) - deliberately open (not cyclic), i.e. a slit, not a loop.
+    Vector = mathutils.Vector
+    _add_seam_curve_for(
+        mesh_obj, [Vector((-1.0, 0.0, 0.0)), Vector((-0.3, 0.0, 0.0))], cyclic=False
+    )
 
     bpy.context.view_layer.objects.active = mesh_obj
     result = bpy.ops.usbee.flatten_all()
@@ -290,25 +274,15 @@ def test_seam_curve_tube_hugs_surface():
     mesh_obj = bpy.context.active_object
     mesh_obj.name = "Sphere"
 
-    bpy.context.view_layer.objects.active = mesh_obj
-    bpy.ops.usbee.add_seam_curve()
-    curve_obj = bpy.context.active_object
+    Vector = mathutils.Vector
     # A straight chord across the sphere - if projection ran before/without
-    # subdivision (or in the wrong order relative to thickening), this
-    # would look like a straight rod poking through the interior instead of
-    # a tube hugging the curved surface.
-    spline = curve_obj.data.splines[0]
-    spline.points[0].co = (-0.9, 0.0, 0.4, 1.0)
-    spline.points[1].co = (0.9, 0.0, 0.4, 1.0)
-    spline.use_cyclic_u = False
+    # subdivision, this would look like a straight rod poking through the
+    # interior instead of a tube hugging the curved surface.
+    curve_obj = _add_seam_curve_for(
+        mesh_obj, [Vector((-0.9, 0.0, 0.4)), Vector((0.9, 0.0, 0.4))], cyclic=False
+    )
 
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    depsgraph.update()
-    eval_obj = curve_obj.evaluated_get(depsgraph)
-    eval_mesh = eval_obj.to_mesh()
-    verts = [tuple(v.co) for v in eval_mesh.vertices]
-    eval_obj.to_mesh_clear()
-
+    verts = [tuple(v.co) for v in curve_obj.data.vertices]
     assert len(verts) > 20, (
         f"expected the display tube to be resampled into many points to "
         f"hug the surface, got only {len(verts)} raw vertices"
@@ -327,6 +301,8 @@ def test_seam_curve_tube_hugs_surface():
 
 @test("seam curve on a mirror-modifier seam doesn't zigzag between the two mirrored halves")
 def test_seam_curve_mirror_bias_no_zigzag():
+    import bmesh
+
     _clean_scene()
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=24, ring_count=12)
     base = bpy.context.active_object
@@ -342,25 +318,16 @@ def test_seam_curve_mirror_bias_no_zigzag():
     mirror_mod = base.modifiers.new("Mirror", "MIRROR")
     mirror_mod.use_axis = (True, False, False)
 
-    bpy.context.view_layer.objects.active = base
-    bpy.ops.usbee.add_seam_curve()
-    curve_obj = bpy.context.active_object
-    spline = curve_obj.data.splines[0]
+    Vector = mathutils.Vector
     # A straight line running exactly along the mirror seam (x=0) - without
     # the bias fix, resampled points along this line flip unpredictably
     # between the left and right mirrored surface (both equally "nearest"),
     # producing a zigzag that crosses back and forth across x=0.
-    spline.points[0].co = (0.0, -0.9, 0.3, 1.0)
-    spline.points[1].co = (0.0, 0.9, 0.3, 1.0)
-    spline.use_cyclic_u = False
+    curve_obj = _add_seam_curve_for(
+        base, [Vector((0.0, -0.9, 0.3)), Vector((0.0, 0.9, 0.3))], cyclic=False
+    )
 
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    depsgraph.update()
-    eval_obj = curve_obj.evaluated_get(depsgraph)
-    eval_mesh = eval_obj.to_mesh()
-    xs = [v.co.x for v in eval_mesh.vertices]
-    eval_obj.to_mesh_clear()
-
+    xs = [v.co.x for v in curve_obj.data.vertices]
     signs = {1 if x > 1e-6 else (-1 if x < -1e-6 else 0) for x in xs}
     assert signs != {1, -1}, (
         f"tube crosses back and forth across the mirror plane (x values on "
@@ -369,45 +336,38 @@ def test_seam_curve_mirror_bias_no_zigzag():
     )
 
 
-@test("a Mirror modifier added after curve creation gets pushed before the display tube, not after")
-def test_modifier_order_self_heals():
+@test("mirroring a seam curve reflects its points across the mesh's mirror plane")
+def test_mirror_seam_curve_operator():
     _clean_scene()
-    bpy.ops.mesh.primitive_plane_add(size=2.0)
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=24, ring_count=12)
     mesh_obj = bpy.context.active_object
-    mesh_obj.name = "Plane"
+    mesh_obj.name = "Sphere"
+    mirror_mod = mesh_obj.modifiers.new("Mirror", "MIRROR")
+    mirror_mod.use_axis = (True, False, False)
 
-    bpy.context.view_layer.objects.active = mesh_obj
-    bpy.ops.usbee.add_seam_curve()
-    curve_obj = bpy.context.active_object
+    Vector = mathutils.Vector
+    original_points = [Vector((0.3, 0.4, 0.5)), Vector((0.35, -0.4, 0.5))]
+    curve_obj = _add_seam_curve_for(mesh_obj, original_points, cyclic=False)
 
-    from bl_ext.user_default.usbee.geometry import curve_display
+    bpy.context.view_layer.objects.active = curve_obj
+    for obj in bpy.context.selected_objects:
+        obj.select_set(False)
+    curve_obj.select_set(True)
+    result = bpy.ops.usbee.mirror_seam_curve()
+    assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
 
-    assert [m.name for m in curve_obj.modifiers] == [curve_display.MODIFIER_NAME], (
-        "expected only the display modifier right after creation"
-    )
+    mirrored = bpy.context.active_object
+    assert mirrored is not curve_obj, "expected a new, separate object"
+    assert mirrored.get("usbee_seam_source_object") == mesh_obj.name
 
-    # Simulate the user adding their own Mirror modifier via Blender's UI,
-    # which always appends to the end - landing *after* our display
-    # modifier, i.e. in the wrong place, exactly like the reported bug
-    # (Mirror ends up mirroring the generated tube mesh, not the curve).
-    curve_obj.modifiers.new(name="Mirror", type="MIRROR")
-    assert [m.name for m in curve_obj.modifiers] == [curve_display.MODIFIER_NAME, "Mirror"], (
-        "test setup assumption broken: Blender didn't append Mirror to the end"
-    )
+    from bl_ext.user_default.usbee.geometry import seam_points as seam_points_mod
 
-    # This is what the depsgraph handler calls on every update to
-    # self-heal the order without needing a hook into the user's own
-    # modifier-stack edits.
-    curve_display.ensure_modifier_last(curve_obj)
-    assert curve_obj.modifiers[-1].name == curve_display.MODIFIER_NAME, (
-        "ensure_modifier_last should have pushed the display modifier back to the end"
-    )
-
-    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
-
-    assert seam_curve_ops._fix_modifier_order_handler in bpy.app.handlers.depsgraph_update_post, (
-        "expected the self-healing handler to be registered while the addon is enabled"
-    )
+    mirrored_points, _closed = seam_points_mod.load_points(mirrored)
+    assert len(mirrored_points) == len(original_points)
+    for orig, mirr in zip(original_points, mirrored_points):
+        assert abs(orig.x + mirr.x) < 1e-6, f"expected x reflected across 0: {orig.x} vs {mirr.x}"
+        assert abs(orig.y - mirr.y) < 1e-6, "y should be unchanged by an x-axis mirror"
+        assert abs(orig.z - mirr.z) < 1e-6, "z should be unchanged by an x-axis mirror"
 
 
 @test("a new seam curve can snap to segments of an already-drawn one on the same mesh")
@@ -417,71 +377,24 @@ def test_snap_to_other_seam_curve_segments():
     mesh_obj = bpy.context.active_object
     mesh_obj.name = "Grid"
 
-    bpy.context.view_layer.objects.active = mesh_obj
-    bpy.ops.usbee.add_seam_curve()
-    existing_curve = bpy.context.active_object
-    existing_curve.name = "ExistingSeam"
-
-    bpy.context.view_layer.objects.active = mesh_obj
-    bpy.ops.usbee.add_seam_curve()
-    new_curve = bpy.context.active_object
+    Vector = mathutils.Vector
+    existing_curve = _add_seam_curve_for(
+        mesh_obj, [Vector((-0.5, 0.0, 0.0)), Vector((0.5, 0.0, 0.0))], cyclic=False
+    )
+    new_curve = _add_seam_curve_for(
+        mesh_obj, [Vector((-0.5, 0.5, 0.0)), Vector((0.5, 0.5, 0.0))], cyclic=False
+    )
     assert new_curve is not existing_curve
 
     from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
 
-    segments = seam_curve_ops._other_seam_curve_segments(bpy.context, mesh_obj, exclude_curve_obj=new_curve)
+    segments = seam_curve_ops._other_seam_curve_segments(mesh_obj, exclude_curve_obj=new_curve)
     assert len(segments) == 1, f"expected exactly 1 segment from the other curve, got {len(segments)}"
 
-    # Excluding the *other* curve instead should find the same count again
-    # are identical 2-point blanks at the same seed location, so this also
-    # confirms exclusion is by identity, not by content).
     segments_excluding_existing = seam_curve_ops._other_seam_curve_segments(
-        bpy.context, mesh_obj, exclude_curve_obj=existing_curve
+        mesh_obj, exclude_curve_obj=existing_curve
     )
     assert len(segments_excluding_existing) == 1, "expected to find new_curve's segment instead"
-
-
-@test("modifiers on the seam curve itself (Array) are respected when resolving cuts")
-def test_seam_curve_array_modifier():
-    _clean_scene()
-    bpy.ops.mesh.primitive_grid_add(x_subdivisions=8, y_subdivisions=4, size=4.0)
-    mesh_obj = bpy.context.active_object
-    mesh_obj.name = "WideGrid"
-
-    bpy.context.view_layer.objects.active = mesh_obj
-    bpy.ops.usbee.add_seam_curve()
-    curve_obj = bpy.context.active_object
-    # A single short open dart near the left edge...
-    spline = curve_obj.data.splines[0]
-    spline.points[0].co = (-2.0, 0.0, 0.0, 1.0)
-    spline.points[1].co = (-1.5, 0.0, 0.0, 1.0)
-    spline.use_cyclic_u = False
-
-    bpy.context.view_layer.objects.active = mesh_obj
-    baseline = bpy.ops.usbee.flatten_all()
-    assert baseline == {"FINISHED"}
-    single_dart_verts = len(bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object].data.vertices)
-
-    # ...arrayed into 3 copies spread across the grid. If the resolver reads
-    # the curve's raw (un-arrayed) points instead of its evaluated geometry,
-    # this would have no additional effect versus the single-dart baseline.
-    array_mod = curve_obj.modifiers.new(name="Array", type="ARRAY")
-    array_mod.count = 2
-    array_mod.use_relative_offset = False
-    array_mod.use_constant_offset = True
-    array_mod.constant_offset_displace = (0.0, 1.0, 0.0)
-
-    bpy.context.view_layer.objects.active = mesh_obj
-    result = bpy.ops.usbee.flatten_all()
-    assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
-    assert len(mesh_obj.usbee_pieces) == 1, "darts shouldn't split the mesh into separate islands"
-
-    arrayed_verts = len(bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object].data.vertices)
-    assert arrayed_verts > single_dart_verts, (
-        f"Array modifier on the seam curve had no effect - resolver is "
-        f"reading raw curve points instead of evaluated (post-modifier) "
-        f"geometry (single-dart verts={single_dart_verts}, arrayed verts={arrayed_verts})"
-    )
 
 
 @test("SVG export: writes a well-formed file with the right piece count")
