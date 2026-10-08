@@ -183,17 +183,28 @@ def refresh_display(context, curve_obj, force=False):
     return tube_obj
 
 
-def create_seam_curve_object(context, mesh_obj, points, closed, name="SeamCurve"):
+def create_seam_curve_object(context, mesh_obj, points, closed, name="SeamCurve", edges=None):
     """Creates a new seam curve skeleton object (plain Mesh, verts+edges,
     no faces) from a world-space point list, plus its initial display
-    tube."""
+    tube.
+
+    By default the points form one path (a loop if closed). Pass edges - a
+    list of (i, j) index pairs into points - to build an arbitrary
+    branching skeleton instead (closed is then ignored). Seams that cross
+    or meet each other should share a vertex in one skeleton like this:
+    junctions are only guaranteed to cut cleanly within a single curve
+    object (see geometry.islands' shared vertex_cache)."""
     mesh_data = bpy.data.meshes.new(name)
     bm = bmesh.new()
     bm_verts = [bm.verts.new(p) for p in points]
-    for i in range(len(bm_verts) - 1):
-        bm.edges.new((bm_verts[i], bm_verts[i + 1]))
-    if closed and len(bm_verts) > 2:
-        bm.edges.new((bm_verts[-1], bm_verts[0]))
+    if edges is not None:
+        for i, j in edges:
+            bm.edges.new((bm_verts[i], bm_verts[j]))
+    else:
+        for i in range(len(bm_verts) - 1):
+            bm.edges.new((bm_verts[i], bm_verts[i + 1]))
+        if closed and len(bm_verts) > 2:
+            bm.edges.new((bm_verts[-1], bm_verts[0]))
     bm.to_mesh(mesh_data)
     bm.free()
 
