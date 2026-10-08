@@ -1,16 +1,62 @@
-# USBee Sewing Patterns
+# Seams to Fur Patterns
 
-Blender extension for generating flat sewing/cutting patterns from 3D models
-(foam crafting, laser cutting, fabric sewing - especially faux fur for
-plush/costume pieces). Phase 1 covers non-destructive seam marking,
-distortion-bounded flattening via [Boundary First
+A Blender 5.x extension for turning a 3D model into flat, fabrication-ready
+sewing/cutting patterns — foam crafting, laser cutting, and fabric sewing,
+with particular attention to faux-fur plush/costume construction (grain
+direction, fur-length preview, real fabric-swatch matching).
+
+Seams are drawn non-destructively as editable curves on the surface, cut
+into pieces and flattened with distortion-bounded [Boundary First
 Flattening](https://github.com/GeometryCollective/boundary-first-flattening)
-(BFF), per-piece offset/shrink, and SVG export. See
-`.claude/plans` (or ask) for the full Phase 1/2+ design doc.
+(BFF), and exported as SVG or a real garment-industry-layered DXF — complete
+with grainlines, seam-allowance markings, and piece-to-piece alignment
+notches.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for how the pipeline and code are
+put together.
+
+## Features
+
+- **Non-destructive seam marking** — draw a seam curve directly on the
+  mesh surface; edit it any time (add/move/delete points) and only the
+  piece(s) it affects get re-baked.
+- **Distortion-bounded flattening** via BFF, with a **distortion preview**
+  (shown on the curved model itself) colored on a real physical stretch-
+  percentage scale, tuned for a heavy knit fur backing.
+- **Seam allowance** — a per-piece offset (grow/shrink) generates a
+  separate cut-line boundary, live, without touching the reference
+  flattened shape.
+- **Grain/fur direction** — click-drag directly on the sliced 3D preview
+  to set a piece's fabric grain direction (with mirror-piece editing);
+  mapped onto the flattened 2D piece and into the export as a real
+  double-headed grainline arrow.
+- **Per-piece color**, matched against a real 66-color faux-fur swatch
+  catalog, with a picker panel (select piece(s) in the list or viewport,
+  click a swatch) and a live particle-hair preview of length/color/grain
+  on the actual sliced pieces.
+- **Piece-to-piece alignment notches**, computed from which pieces
+  actually share a sewn seam.
+- **Export**: SVG and DXF (`SEWLINE`/`CUTLINE`/`GRAINLINE`/`NOTCHES`/
+  `LABELS` layers), both at correct real-world millimetre scale.
+
+## Basic workflow
+
+1. Select the source mesh, click **Draw Seam Curve**, click along the
+   surface to place a cut path (or a closed loop for a dart/patch).
+2. **Flatten All** to run the seam → island → BFF pipeline and produce one
+   flat pattern-piece object per island.
+3. Dial in **Material Thickness** and each piece's seam-allowance
+   **Offset** as needed.
+4. Optionally: set **Grain Direction** on the Sliced Preview, pick a
+   **fabric color**, tune **Fur Length**, and **Apply Fur Preview** to see
+   it on the model.
+5. Check the **Distortion Preview** for pieces that are stretching past
+   the fabric's realistic limit and may need an extra seam.
+6. **Export Sewing Pattern (SVG)** or **(DXF)**.
 
 ## Development setup
 
-The addon lives in `usbee/` as a Blender 5.x extension package.
+The addon lives in `seams_to_fur/` as a Blender 5.x extension package.
 
 Build BFF's CLI backend once (Linux shown; needs `cmake` and SuiteSparse):
 
@@ -23,8 +69,8 @@ cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release \
       -DBFF_BUILD_GUI=OFF -DBFF_BUILD_CLI=ON \
       -DCMAKE_CXX_FLAGS="-include cstdint" -DCMAKE_EXE_LINKER_FLAGS="-lcblas" ..
 make -j"$(nproc)"
-cp bff-command-line /path/to/seams-to-fur-patterns/usbee/backends/bin/linux-x64/
-chmod +x /path/to/seams-to-fur-patterns/usbee/backends/bin/linux-x64/bff-command-line
+cp bff-command-line /path/to/seams-to-fur-patterns/seams_to_fur/backends/bin/linux-x64/
+chmod +x /path/to/seams-to-fur-patterns/seams_to_fur/backends/bin/linux-x64/bff-command-line
 ```
 
 This build dynamically links against the system SuiteSparse install, so it's
@@ -35,8 +81,8 @@ future work.
 Build and install the extension into Blender's local "User Default" repo:
 
 ```sh
-blender --command extension build --source-dir usbee --output-dir /tmp
-blender --command extension install-file --repo user_default --enable /tmp/usbee-0.1.0.zip
+blender --command extension build --source-dir seams_to_fur --output-dir /tmp
+blender --command extension install-file --repo user_default --enable /tmp/seams_to_fur-0.1.0.zip
 ```
 
 ## Tests
@@ -44,4 +90,6 @@ blender --command extension install-file --repo user_default --enable /tmp/usbee
 ```sh
 python3 -m pytest tests/unit/                 # bpy-free geometry/export logic
 blender --background --factory-startup --python tests/headless/test_flatten_pipeline.py
+blender --background --factory-startup --python tests/headless/test_appearance.py
+blender --background --factory-startup --python tests/headless/test_export.py
 ```

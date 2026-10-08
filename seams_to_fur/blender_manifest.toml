@@ -1,0 +1,29 @@
+schema_version = "1.0.0"
+
+id = "seams_to_fur"
+version = "0.1.0"
+name = "Seams to Fur Patterns"
+tagline = "Non-destructive flat patterns for fabric, foam, laser cutting"
+maintainer = "Jack LeFevre <claude@jacklefevre.com>"
+type = "add-on"
+
+tags = ["Mesh", "UV", "Import-Export"]
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+
+blender_version_min = "5.0.0"
+
+platforms = ["linux-x64", "windows-x64", "macos-x64", "macos-arm64"]
+
+# "files" for temp OBJ I/O with the BFF backend, "network" for fetching the
+# BFF binary on first use when it isn't vendored for the current platform.
+permissions = { files = "Read/write temporary mesh files for the flattening backend", network = "Download the flattening backend binary on first use" }
+
+[build]
+paths_exclude_pattern = [
+    "__pycache__/",
+    "*.pyc",
+    ".git/",
+]

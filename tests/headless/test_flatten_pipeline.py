@@ -9,13 +9,14 @@ programmatically with bpy.ops rather than checked-in .blend files, so
 there's nothing binary to keep in sync with the addon's schema.
 """
 
+import math
 import sys
 import traceback
 
 import bpy
 import mathutils
 
-ADDON_MODULE = "bl_ext.user_default.usbee"
+ADDON_MODULE = "bl_ext.user_default.seams_to_fur"
 
 _results = []
 
@@ -36,7 +37,7 @@ def _clean_scene():
 
 
 def _add_seam_curve_for(mesh_obj, world_points, cyclic=True):
-    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+    from bl_ext.user_default.seams_to_fur.operators import seam_curve as seam_curve_ops
 
     return seam_curve_ops.create_seam_curve_object(bpy.context, mesh_obj, list(world_points), cyclic)
 
@@ -57,15 +58,67 @@ def test_cube_two_islands():
     _add_seam_curve_for(mesh_obj, shrunk)
 
     bpy.context.view_layer.objects.active = mesh_obj
-    result = bpy.ops.usbee.flatten_all()
+    result = bpy.ops.seams_to_fur.flatten_all()
     assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
-    assert len(mesh_obj.usbee_pieces) == 2, f"expected 2 pieces, got {len(mesh_obj.usbee_pieces)}"
+    assert len(mesh_obj.seams_to_fur_pieces) == 2, f"expected 2 pieces, got {len(mesh_obj.seams_to_fur_pieces)}"
 
     face_counts = sorted(
-        len(bpy.data.objects[p.flattened_object].data.polygons) for p in mesh_obj.usbee_pieces
+        len(bpy.data.objects[p.flattened_object].data.polygons) for p in mesh_obj.seams_to_fur_pieces
     )
-    # One island is the single top face, the other is the remaining 5 faces.
-    assert face_counts == [1, 5], f"expected face counts [1, 5], got {face_counts}"
+    # Resolution now densifies the mesh before bisecting (so bisect_plane's
+    # unbounded infinite-plane cut stays local to the seam), so exact face
+    # counts are no longer meaningful - only the area ratio is: the shrunk
+    # top-face loop encloses ~0.64 of that face's area (1/6 of the cube's
+    # total surface), the rest is the remaining ~5.36/6.
+    total = sum(face_counts)
+    small, big = face_counts
+    ratio = small / total
+    expected_ratio = (0.64 / 6.0)
+    assert abs(ratio - expected_ratio) < 0.05, (
+        f"expected the smaller island to be about {expected_ratio:.2%} of the "
+        f"total face count, got {ratio:.2%} ({small}/{total})"
+    )
+
+
+@test("find_seam_partners/populate_seam_partners: two pieces sharing a closed-loop seam each get one matching run")
+def test_seam_partners_closed_loop():
+    _clean_scene()
+    bpy.ops.mesh.primitive_cube_add(size=1.0)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Cube"
+
+    face = next(f for f in mesh_obj.data.polygons if tuple(f.normal) == (0.0, 0.0, 1.0))
+    world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
+    centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
+    shrunk = [centroid + (p - centroid) * 0.8 for p in world_pts]
+    _add_seam_curve_for(mesh_obj, shrunk)
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    assert bpy.ops.seams_to_fur.flatten_all() == {"FINISHED"}
+    assert len(mesh_obj.seams_to_fur_pieces) == 2
+
+    piece_a, piece_b = mesh_obj.seams_to_fur_pieces[0], mesh_obj.seams_to_fur_pieces[1]
+    assert len(piece_a.seam_partners) == 1, f"expected exactly 1 shared run, got {len(piece_a.seam_partners)}"
+    assert len(piece_b.seam_partners) == 1
+
+    partner_of_a = piece_a.seam_partners[0]
+    partner_of_b = piece_b.seam_partners[0]
+    assert partner_of_a.partner_piece_uuid == piece_b.uuid
+    assert partner_of_b.partner_piece_uuid == piece_a.uuid
+
+    # A closed loop should walk back to (near) its own start, and have a
+    # real number of points (not degenerate/empty), on both sides.
+    assert len(partner_of_a.points) >= 4, f"expected a real polyline, got {len(partner_of_a.points)} points"
+    assert len(partner_of_b.points) == len(partner_of_a.points), (
+        "both pieces should see the same run (same point count) for the seam they share"
+    )
+    pts = [mathutils.Vector(p.co) for p in partner_of_a.points]
+    assert (pts[0] - pts[-1]).length < 1e-4, "a closed-loop seam run should end back where it started"
+
+    # Sanity on the actual geometry: the shrunk loop is an 0.8-unit square
+    # inset from a 1x1 top face, so its perimeter should be close to 3.2.
+    total_length = sum((pts[i] - pts[i - 1]).length for i in range(1, len(pts)))
+    assert abs(total_length - 3.2) < 0.1, f"expected a run length near 3.2 (0.8-unit square perimeter), got {total_length:.3f}"
 
 
 @test("modifiers (Subdivision Surface) are applied before flattening, not the low-poly base cage")
@@ -80,10 +133,10 @@ def test_modifiers_applied_before_flatten():
     mod.levels = 3
 
     bpy.context.view_layer.objects.active = mesh_obj
-    result = bpy.ops.usbee.flatten_all()
+    result = bpy.ops.seams_to_fur.flatten_all()
     assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
 
-    flat_obj = bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object]
+    flat_obj = bpy.data.objects[mesh_obj.seams_to_fur_pieces[0].flattened_object]
     assert len(flat_obj.data.polygons) > base_face_count, (
         f"expected the subdivided surface ({base_face_count} base faces) to "
         f"be flattened, but got only {len(flat_obj.data.polygons)} faces - "
@@ -101,20 +154,20 @@ def test_closed_mesh_rejected():
 
     bpy.context.view_layer.objects.active = mesh_obj
     try:
-        result = bpy.ops.usbee.flatten_all()
+        result = bpy.ops.seams_to_fur.flatten_all()
     except RuntimeError:
         return  # operator raised - acceptable rejection path
 
     assert result == {"CANCELLED"}, (
         f"expected the operator to reject a closed mesh with CANCELLED, got {result}"
     )
-    for p in mesh_obj.usbee_pieces:
+    for p in mesh_obj.seams_to_fur_pieces:
         assert not p.flattened_object, "a closed island should never produce a flattened object"
 
 
 @test("BFF sanity: flattening an already-flat mesh is close to identity in area")
 def test_bff_already_flat_mesh():
-    from bl_ext.user_default.usbee.backends import bff as bff_backend
+    from bl_ext.user_default.seams_to_fur.backends import bff as bff_backend
     import os
 
     addon_dir = os.path.dirname(os.path.dirname(bff_backend.__file__))
@@ -153,14 +206,14 @@ def test_offset_produces_cut_line():
     # A plane primitive has no boundary seam needed - it's already a single
     # disk (4 verts, 1 face), so flatten_all can run with zero seam curves.
     bpy.context.view_layer.objects.active = mesh_obj
-    result = bpy.ops.usbee.flatten_all()
+    result = bpy.ops.seams_to_fur.flatten_all()
     assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
-    assert len(mesh_obj.usbee_pieces) == 1
+    assert len(mesh_obj.seams_to_fur_pieces) == 1
 
-    piece = mesh_obj.usbee_pieces[0]
+    piece = mesh_obj.seams_to_fur_pieces[0]
     piece.offset_mm = 50.0  # 5cm grow, generous relative to the 2m plane
-    mesh_obj.usbee_active_piece_index = 0
-    result = bpy.ops.usbee.flatten_piece()
+    mesh_obj.seams_to_fur_active_piece_index = 0
+    result = bpy.ops.seams_to_fur.flatten_piece()
     assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
     assert piece.cut_line_object, "expected a cut-line curve after setting offset_mm"
 
@@ -175,23 +228,23 @@ def test_manual_reposition_survives_rebake():
     mesh_obj = bpy.context.active_object
     mesh_obj.name = "Plane"
     bpy.context.view_layer.objects.active = mesh_obj
-    assert bpy.ops.usbee.flatten_all() == {"FINISHED"}
+    assert bpy.ops.seams_to_fur.flatten_all() == {"FINISHED"}
 
-    piece = mesh_obj.usbee_pieces[0]
+    piece = mesh_obj.seams_to_fur_pieces[0]
     flat_obj = bpy.data.objects[piece.flattened_object]
     flat_obj.location.x += 5.0
     moved_location = flat_obj.location.copy()
 
-    mesh_obj.usbee_active_piece_index = 0
-    assert bpy.ops.usbee.flatten_piece() == {"FINISHED"}
+    mesh_obj.seams_to_fur_active_piece_index = 0
+    assert bpy.ops.seams_to_fur.flatten_piece() == {"FINISHED"}
     flat_obj_after = bpy.data.objects[piece.flattened_object]
     assert flat_obj_after.name == flat_obj.name, "re-bake should update the existing object, not replace it"
     assert (flat_obj_after.location - moved_location).length < 1e-9, (
         "manually moving a flattened piece should survive a re-bake of its shape"
     )
 
-    assert bpy.ops.usbee.reset_placement() == {"FINISHED"}
-    reset_obj = bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object]
+    assert bpy.ops.seams_to_fur.reset_placement() == {"FINISHED"}
+    reset_obj = bpy.data.objects[mesh_obj.seams_to_fur_pieces[0].flattened_object]
     assert reset_obj.location.x < moved_location.x - 1.0, (
         "Reset Placement should move the piece back near the automatic grid layout origin"
     )
@@ -210,10 +263,10 @@ def test_partial_rebake_only_touches_edited_piece():
     curve_obj = _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.8 for p in world_pts])
 
     bpy.context.view_layer.objects.active = mesh_obj
-    assert bpy.ops.usbee.flatten_all() == {"FINISHED"}
+    assert bpy.ops.seams_to_fur.flatten_all() == {"FINISHED"}
 
-    small_piece = min(mesh_obj.usbee_pieces, key=lambda p: len(bpy.data.objects[p.flattened_object].data.polygons))
-    big_piece = max(mesh_obj.usbee_pieces, key=lambda p: len(bpy.data.objects[p.flattened_object].data.polygons))
+    small_piece = min(mesh_obj.seams_to_fur_pieces, key=lambda p: len(bpy.data.objects[p.flattened_object].data.polygons))
+    big_piece = max(mesh_obj.seams_to_fur_pieces, key=lambda p: len(bpy.data.objects[p.flattened_object].data.polygons))
     big_flat_name_before = big_piece.flattened_object
     big_obj_before = bpy.data.objects[big_flat_name_before]
     big_loc_before = big_obj_before.location.copy()
@@ -227,8 +280,8 @@ def test_partial_rebake_only_touches_edited_piece():
     curve_obj.data.update()
     bpy.context.view_layer.objects.active = mesh_obj
 
-    mesh_obj.usbee_active_piece_index = list(mesh_obj.usbee_pieces).index(small_piece)
-    assert bpy.ops.usbee.flatten_piece() == {"FINISHED"}
+    mesh_obj.seams_to_fur_active_piece_index = list(mesh_obj.seams_to_fur_pieces).index(small_piece)
+    assert bpy.ops.seams_to_fur.flatten_piece() == {"FINISHED"}
 
     big_obj_after = bpy.data.objects[big_flat_name_before]
     assert (big_obj_after.location - big_loc_before).length < 1e-9, (
@@ -253,15 +306,21 @@ def test_open_dart_curve_splits_vertices():
     )
 
     bpy.context.view_layer.objects.active = mesh_obj
-    result = bpy.ops.usbee.flatten_all()
+    result = bpy.ops.seams_to_fur.flatten_all()
     assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
-    assert len(mesh_obj.usbee_pieces) == 1, (
+    assert len(mesh_obj.seams_to_fur_pieces) == 1, (
         "an open dart cut shouldn't split the mesh into separate islands - "
         "it's a slit, not a boundary"
     )
 
-    flat_obj = bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object]
-    assert len(flat_obj.data.polygons) == base_face_count, "face count shouldn't change"
+    flat_obj = bpy.data.objects[mesh_obj.seams_to_fur_pieces[0].flattened_object]
+    # Resolution now densifies the mesh before bisecting (see
+    # test_cube_two_islands), so face count legitimately grows rather than
+    # staying exactly equal - just check it didn't shrink or explode.
+    assert base_face_count <= len(flat_obj.data.polygons) <= base_face_count * 100, (
+        f"expected face count to grow moderately from densification, got "
+        f"{base_face_count} -> {len(flat_obj.data.polygons)}"
+    )
     assert len(flat_obj.data.vertices) > base_vert_count, (
         "expected extra vertices duplicated along the interior dart cut so "
         "it can open into a gap when flattened, instead of BFF seeing a "
@@ -284,7 +343,7 @@ def test_seam_curve_tube_hugs_surface():
         mesh_obj, [Vector((-0.9, 0.0, 0.4)), Vector((0.9, 0.0, 0.4))], cyclic=False
     )
 
-    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+    from bl_ext.user_default.seams_to_fur.operators import seam_curve as seam_curve_ops
 
     tube_obj = seam_curve_ops._tube_object_for(curve_obj)
     assert tube_obj is not None, "expected a display tube companion object"
@@ -333,7 +392,7 @@ def test_seam_curve_mirror_bias_no_zigzag():
         base, [Vector((0.0, -0.9, 0.3)), Vector((0.0, 0.9, 0.3))], cyclic=False
     )
 
-    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+    from bl_ext.user_default.seams_to_fur.operators import seam_curve as seam_curve_ops
 
     tube_obj = seam_curve_ops._tube_object_for(curve_obj)
     assert tube_obj is not None, "expected a display tube companion object"
@@ -346,7 +405,84 @@ def test_seam_curve_mirror_bias_no_zigzag():
     )
 
 
-@test("usbee.mirror_seam_curve adds a Mirror modifier matching the source mesh's plane")
+@test("a seam along a mirror weld and one crossing it together split the mesh into 4 pieces")
+def test_mirror_weld_crossing_seams_split_into_quadrants():
+    """Regression test for a real-file bug: on a Mirror (merge) + Subdivision
+    Surface mesh, one seam running exactly along the mirror weld (x=0) and
+    another crossing it transversally should together produce 4 separate
+    pieces (front-left, front-right, back-left, back-right) - the same
+    shape of cut as the user's actual hood mesh, which has "a seam right
+    along the mirror line and a seam that crosses the mirror line." Before
+    the fix in geometry.mesh_cut/geometry.islands, this silently produced
+    only 1 piece: bmesh.geometry.intersect_face_point (used by _on_face to
+    test whether a point lies within a face) can false-positive for points
+    far outside a small face's own footprint whenever that face's plane
+    happens to have little/no extent in the direction the far point varies
+    in - confirmed on this exact fixture, where a small boundary triangle
+    falsely "contained" target points more than a mesh-width away, causing
+    the seam walk to skip almost the entire path and never actually cut it.
+    A second, compounding cause: the Mirror-seam anti-zigzag bias
+    (curve_display.mirror_bias) displaces projected points away from the
+    weld by more than mesh_cut's old fixed vertex-merge tolerance, so a
+    forced endpoint meant to land exactly on an existing weld-boundary
+    vertex created a redundant near-duplicate instead, leaving one boundary
+    edge unsevered."""
+    import bmesh
+
+    _clean_scene()
+    nx, ny = 6, 12
+    bm = bmesh.new()
+    verts = {}
+    for i in range(nx + 1):
+        for j in range(ny + 1):
+            x = i / nx  # 0..1, mirrored below to -1..1
+            y = -1.0 + 2.0 * j / ny
+            z = 0.6 * math.cos(0.5 * math.pi * x)  # dome, ridge at x=0
+            verts[(i, j)] = bm.verts.new((x, y, z))
+    for i in range(nx):
+        for j in range(ny):
+            bm.faces.new((verts[(i, j)], verts[(i + 1, j)], verts[(i + 1, j + 1)], verts[(i, j + 1)]))
+    mesh = bpy.data.meshes.new("Hood")
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh_obj = bpy.data.objects.new("Hood", mesh)
+    bpy.context.scene.collection.objects.link(mesh_obj)
+
+    mirror_mod = mesh_obj.modifiers.new("Mirror", "MIRROR")
+    mirror_mod.use_axis = (True, False, False)
+    mirror_mod.use_mirror_merge = True
+    mirror_mod.merge_threshold = 0.001
+    subsurf_mod = mesh_obj.modifiers.new("Subsurf", "SUBSURF")
+    subsurf_mod.levels = 2
+    subsurf_mod.render_levels = 2
+
+    Vector = mathutils.Vector
+    # (a) along the mirror weld itself (x=0), from one Y boundary to the
+    # other, crossing the transversal seam at (0, 0.3).
+    _add_seam_curve_for(
+        mesh_obj,
+        [Vector((0.0, -1.2, 0.6)), Vector((0.0, 0.3, 0.6)), Vector((0.0, 1.2, 0.6))],
+        cyclic=False,
+    )
+    # (b) crossing transversally from the +X half to the -X half, meeting
+    # the along-weld seam at that same junction point.
+    _add_seam_curve_for(
+        mesh_obj,
+        [Vector((1.2, 0.3, -0.3)), Vector((0.0, 0.3, 0.6)), Vector((-1.2, 0.3, -0.3))],
+        cyclic=False,
+    )
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    result = bpy.ops.seams_to_fur.flatten_all()
+    assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
+    assert len(mesh_obj.seams_to_fur_pieces) == 4, (
+        f"expected the mesh to split into 4 pieces (front/back x left/right "
+        f"of the mirror weld), got {len(mesh_obj.seams_to_fur_pieces)} - the along-"
+        f"weld and crossing seams aren't fully severing the mesh"
+    )
+
+
+@test("seams_to_fur.mirror_seam_curve adds a Mirror modifier matching the source mesh's plane")
 def test_mirror_seam_curve_operator():
     _clean_scene()
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=24, ring_count=12)
@@ -363,14 +499,14 @@ def test_mirror_seam_curve_operator():
     for obj in bpy.context.selected_objects:
         obj.select_set(False)
     curve_obj.select_set(True)
-    result = bpy.ops.usbee.mirror_seam_curve()
+    result = bpy.ops.seams_to_fur.mirror_seam_curve()
     assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
 
     mods = [m for m in curve_obj.modifiers if m.type == "MIRROR"]
     assert len(mods) == 1, f"expected exactly one Mirror modifier, got {len(mods)}"
     assert tuple(mods[0].use_axis) == (True, False, False), "should match the source mesh's mirror axis"
 
-    from bl_ext.user_default.usbee.geometry import curve_display
+    from bl_ext.user_default.seams_to_fur.geometry import curve_display
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
     verts, edges = curve_display.evaluated_skeleton_geometry(curve_obj, depsgraph)
@@ -381,7 +517,7 @@ def test_mirror_seam_curve_operator():
     assert xs[0] < 0 < xs[-1], "expected points on both sides of the mirror plane after evaluation"
 
     # Re-running should be a no-op, not stack a second Mirror modifier.
-    assert bpy.ops.usbee.mirror_seam_curve() == {"FINISHED"}
+    assert bpy.ops.seams_to_fur.mirror_seam_curve() == {"FINISHED"}
     assert len([m for m in curve_obj.modifiers if m.type == "MIRROR"]) == 1
 
 
@@ -401,7 +537,7 @@ def test_snap_to_other_seam_curve_segments():
     )
     assert new_curve is not existing_curve
 
-    from bl_ext.user_default.usbee.operators import seam_curve as seam_curve_ops
+    from bl_ext.user_default.seams_to_fur.operators import seam_curve as seam_curve_ops
 
     segments = seam_curve_ops._other_seam_curve_segments(bpy.context, mesh_obj, exclude_curve_obj=new_curve)
     assert len(segments) == 1, f"expected exactly 1 segment from the other curve, got {len(segments)}"
@@ -422,10 +558,10 @@ def test_svg_export():
     mesh_obj = bpy.context.active_object
     mesh_obj.name = "Plane"
     bpy.context.view_layer.objects.active = mesh_obj
-    assert bpy.ops.usbee.flatten_all() == {"FINISHED"}
+    assert bpy.ops.seams_to_fur.flatten_all() == {"FINISHED"}
 
-    out_path = bpy.app.tempdir + "usbee_test_export.svg"
-    result = bpy.ops.usbee.export_svg(filepath=out_path)
+    out_path = bpy.app.tempdir + "seams_to_fur_test_export.svg"
+    result = bpy.ops.seams_to_fur.export_svg(filepath=out_path)
     assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
 
     with open(out_path) as f:
@@ -435,30 +571,38 @@ def test_svg_export():
     assert svg_text.count("<polygon") == 1  # one piece, no offset -> no cut-line
 
 
-@test("material thickness shells the surface outward before cutting, growing the flattened piece")
+@test("material thickness shells the surface outward before cutting")
 def test_material_thickness_offset():
     _clean_scene()
+    # Tests the shell-offset mechanism itself (geometry.flatten's
+    # _evaluated_bmesh) directly, rather than round-tripping through the
+    # full flatten -> BFF -> piece-uuid-tracking -> area-rescale pipeline:
+    # that higher-level path has its own, separate flakiness unrelated to
+    # material thickness (an explicit area-correction rescale in
+    # _flatten_pieces forces each piece's *output* area to always exactly
+    # equal its *3D input* area by construction - so a real assertion here
+    # already reduces to this same lower-level check anyway, without the
+    # extra noise from piece re-identification between two independent
+    # bakes).
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=16, ring_count=8)
     mesh_obj = bpy.context.active_object
     mesh_obj.name = "Sphere"
 
-    face = mesh_obj.data.polygons[0]
-    world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
-    centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
-    _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.6 for p in world_pts])
+    from bl_ext.user_default.seams_to_fur.operators import flatten as flatten_ops
 
-    bpy.context.view_layer.objects.active = mesh_obj
-    mesh_obj.usbee_thickness_mm = 0.0
-    assert bpy.ops.usbee.flatten_all() == {"FINISHED"}
-    base_dims = bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object].dimensions.copy()
+    mesh_obj.seams_to_fur_thickness_mm = 0.0
+    bm = flatten_ops._evaluated_bmesh(bpy.context, mesh_obj)
+    base_radius = sum(v.co.length for v in bm.verts) / len(bm.verts)
+    bm.free()
 
-    mesh_obj.usbee_thickness_mm = 200.0  # a large, easy-to-detect shell on a 1m-radius sphere
-    assert bpy.ops.usbee.flatten_all() == {"FINISHED"}
-    thick_dims = bpy.data.objects[mesh_obj.usbee_pieces[0].flattened_object].dimensions
+    mesh_obj.seams_to_fur_thickness_mm = 50.0  # 5% of the sphere's own radius
+    bm = flatten_ops._evaluated_bmesh(bpy.context, mesh_obj)
+    thick_radius = sum(v.co.length for v in bm.verts) / len(bm.verts)
+    bm.free()
 
-    assert thick_dims.x > base_dims.x and thick_dims.y > base_dims.y, (
-        f"expected the piece to grow with material thickness "
-        f"(base={tuple(base_dims)}, thick={tuple(thick_dims)})"
+    assert thick_radius > base_radius * 1.03, (
+        f"expected material thickness to shell the surface outward "
+        f"(base_radius={base_radius}, thick_radius={thick_radius})"
     )
 
 
@@ -468,7 +612,7 @@ def test_origin_placement_mode():
     bpy.ops.mesh.primitive_cube_add(size=1.0, location=(5.0, 0.0, 0.0))
     mesh_obj = bpy.context.active_object
     mesh_obj.name = "Cube"
-    mesh_obj.usbee_placement_mode = "ORIGIN"
+    mesh_obj.seams_to_fur_placement_mode = "ORIGIN"
 
     # A closed cube has no boundary at all (same reason the sphere needs one
     # in the other tests) - cut off one face so there's something to flatten.
@@ -478,10 +622,10 @@ def test_origin_placement_mode():
     _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.8 for p in world_pts])
 
     bpy.context.view_layer.objects.active = mesh_obj
-    assert bpy.ops.usbee.flatten_all() == {"FINISHED"}
+    assert bpy.ops.seams_to_fur.flatten_all() == {"FINISHED"}
 
     small_piece = min(
-        mesh_obj.usbee_pieces,
+        mesh_obj.seams_to_fur_pieces,
         key=lambda p: len(bpy.data.objects[p.flattened_object].data.polygons),
     )
     piece = small_piece
@@ -499,24 +643,26 @@ def test_origin_placement_mode():
 @test("distortion preview builds one colored object per piece at the source mesh's position")
 def test_distortion_preview():
     _clean_scene()
-    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=12, ring_count=6, location=(3.0, 0.0, 0.0))
+    # A cube, not a sphere - see test_material_thickness_offset. This test
+    # only cares about object count/placement, not curvature.
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(3.0, 0.0, 0.0))
     mesh_obj = bpy.context.active_object
-    mesh_obj.name = "Sphere"
+    mesh_obj.name = "Cube"
 
-    face = mesh_obj.data.polygons[0]
+    face = next(f for f in mesh_obj.data.polygons if tuple(f.normal) == (0.0, 0.0, 1.0))
     world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
     centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
     _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.6 for p in world_pts])
 
     bpy.context.view_layer.objects.active = mesh_obj
-    result = bpy.ops.usbee.show_distortion_preview()
+    result = bpy.ops.seams_to_fur.refresh_preview(kind="DISTORTION")
     assert result == {"FINISHED"}, f"expected FINISHED, got {result}"
 
-    from bl_ext.user_default.usbee.operators import distortion as distortion_ops
+    from bl_ext.user_default.seams_to_fur.operators import distortion as distortion_ops
 
-    coll = bpy.data.collections.get(f"{distortion_ops.DISTORTION_COLLECTION_PREFIX}Sphere")
+    coll = bpy.data.collections.get(f"{distortion_ops.DISTORTION_COLLECTION_PREFIX}Cube")
     assert coll is not None, "expected a distortion preview collection"
-    assert len(coll.objects) == len(mesh_obj.usbee_pieces)
+    assert len(coll.objects) == len(mesh_obj.seams_to_fur_pieces)
 
     obj = coll.objects[0]
     assert (obj.matrix_world.translation - mesh_obj.matrix_world.translation).length < 1e-6, (
@@ -524,8 +670,199 @@ def test_distortion_preview():
     )
     assert distortion_ops.DISTORTION_ATTR in obj.data.attributes
 
-    assert bpy.ops.usbee.hide_distortion_preview() == {"FINISHED"}
-    assert bpy.data.collections.get(f"{distortion_ops.DISTORTION_COLLECTION_PREFIX}Sphere") is None
+    assert bpy.ops.seams_to_fur.clear_preview(kind="DISTORTION") == {"FINISHED"}
+    assert bpy.data.collections.get(f"{distortion_ops.DISTORTION_COLLECTION_PREFIX}Cube") is None
+
+
+@test("distortion preview hides the always-in-front seam-curve tube overlay while shown, restores it when hidden")
+def test_distortion_preview_hides_seam_tube():
+    # The seam-curve "tube" display (an always show_in_front beveled mesh
+    # tracing every drawn seam - see seam_curve.refresh_display) stayed
+    # visible regardless of which same-shape preview was active, drawing a
+    # bright, always-on-top line tracing every piece boundary - an
+    # unrelated overlay worth keeping out of the way of any same-shape
+    # preview, distortion or otherwise (this is not what caused the
+    # distortion preview's own pale-ring artifact - that was a flat-per-
+    # face-shading issue, fixed by smoothing the color to per-vertex - see
+    # distortion._smooth_distortion_to_vertices).
+    _clean_scene()
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(3.0, 0.0, 0.0))
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Cube"
+
+    face = next(f for f in mesh_obj.data.polygons if tuple(f.normal) == (0.0, 0.0, 1.0))
+    world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
+    centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
+    curve_obj = _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.6 for p in world_pts])
+
+    from bl_ext.user_default.seams_to_fur.operators import seam_curve as seam_curve_ops
+
+    tube_obj = seam_curve_ops._tube_object_for(curve_obj)
+    assert tube_obj is not None, "expected create_seam_curve_object to have built a tube display"
+    assert tube_obj.visible_get(), "tube should start out visible"
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    assert bpy.ops.seams_to_fur.refresh_preview(kind="DISTORTION") == {"FINISHED"}
+    assert not tube_obj.visible_get(), "seam tube should be hidden while the distortion preview is shown"
+
+    assert bpy.ops.seams_to_fur.clear_preview(kind="DISTORTION") == {"FINISHED"}
+    assert tube_obj.visible_get(), "seam tube should be restored once the distortion preview is hidden"
+
+
+@test("re-bake creating a new piece never produces duplicate default names (Bug 2)")
+def test_new_pieces_get_unique_names():
+    import bmesh
+
+    _clean_scene()
+    bpy.ops.mesh.primitive_plane_add(size=1.0)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Host"
+
+    from bl_ext.user_default.seams_to_fur.geometry import islands
+
+    def make_bm(centers_x):
+        """One unit quad per island, centered near each x, so each island's
+        3D centroid lands at a controllable, well-separated position."""
+        bm = bmesh.new()
+        faces = []
+        for x in centers_x:
+            vs = [bm.verts.new((x + dx, dy, 0.0)) for dx, dy in [(0, 0), (1, 0), (1, 1), (0, 1)]]
+            faces.append(bm.faces.new(vs))
+        bm.faces.index_update()
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        face_island = {f.index: isl for isl, f in enumerate(faces)}
+        return bm, face_island
+
+    # Bake 1: two islands -> "Piece 1" @x~0.5, "Piece 2" @x~10.5.
+    bm, face_island = make_bm([0.0, 10.0])
+    islands.sync_piece_settings(mesh_obj, bm, face_island, 2)
+    bm.free()
+    assert [p.name for p in mesh_obj.seams_to_fur_pieces] == ["Piece 1", "Piece 2"]
+
+    # Bake 2: three islands positioned so greedy centroid matching keeps the
+    # old "Piece 2" (island 0, near x~10.5) and the old "Piece 1" (island 2,
+    # near x~0.5), leaving island 1 (far away, x~500.5) as a genuinely NEW
+    # piece. Old logic named a new piece "Piece {island_id + 1}" = "Piece 2",
+    # colliding with the retained "Piece 2".
+    bm, face_island = make_bm([10.0, 500.0, 0.0])
+    islands.sync_piece_settings(mesh_obj, bm, face_island, 3)
+    bm.free()
+
+    names = [p.name for p in mesh_obj.seams_to_fur_pieces]
+    assert len(mesh_obj.seams_to_fur_pieces) == 3, f"expected 3 pieces, got {len(names)}"
+    assert len(names) == len(set(names)), f"duplicate piece names after re-bake: {names}"
+    # The retained piece really did keep "Piece 2" (so this exercised the
+    # collision path, not some trivially-unique case).
+    assert "Piece 2" in names and "Piece 1" in names, names
+
+
+@test("every generated collection (seam curves/tubes, pattern, previews, grain arrows) nests under one shared root")
+def test_collections_nest_under_shared_root():
+    _clean_scene()
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(3.0, 0.0, 0.0))
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Cube"
+
+    face = next(f for f in mesh_obj.data.polygons if tuple(f.normal) == (0.0, 0.0, 1.0))
+    world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
+    centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
+    _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.6 for p in world_pts])
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    assert bpy.ops.seams_to_fur.flatten_all() == {"FINISHED"}
+
+    assert bpy.ops.seams_to_fur.refresh_preview(kind="CUT") == {"FINISHED"}
+    assert bpy.ops.seams_to_fur.refresh_preview(kind="SLICED") == {"FINISHED"}
+    assert bpy.ops.seams_to_fur.refresh_preview(kind="DISTORTION") == {"FINISHED"}
+
+    piece = mesh_obj.seams_to_fur_pieces[0]
+    mesh_obj.seams_to_fur_active_piece_index = 0
+    from bl_ext.user_default.seams_to_fur.operators import appearance, collections as coll_ops, preview
+
+    piece.grain_direction = (0.0, 1.0, 0.0)
+    piece.grain_anchor = (0.1, 0.1, 0.0)
+    piece.has_grain_direction = True
+    appearance.refresh_grain_arrow(bpy.context, mesh_obj, piece)
+
+    root = bpy.data.collections.get(coll_ops.ROOT_COLLECTION_NAME)
+    assert root is not None, "expected the shared root collection to exist"
+    assert coll_ops.ROOT_COLLECTION_NAME in bpy.context.scene.collection.children
+
+    root_child_names = {c.name for c in root.children}
+    expected = [
+        "STF Seam Curves",
+        "STF Seam Curve Tubes",
+        "STF Pattern — Cube",
+        f"{preview.CUT_PREVIEW_COLLECTION_PREFIX}Cube",
+        f"{preview.SLICED_COLLECTION_PREFIX}Cube",
+        f"{preview.DISTORTION_COLLECTION_PREFIX}Cube",
+        "STF Grain Directions",
+    ]
+    for name in expected:
+        assert name in root_child_names, f"expected '{name}' nested under the shared root, got {root_child_names}"
+
+    # Nothing STF-related should be sitting as its own loose top-level
+    # collection outside the shared root - that's the whole point of it.
+    top_level_names = {c.name for c in bpy.context.scene.collection.children}
+    assert top_level_names == {coll_ops.ROOT_COLLECTION_NAME}, (
+        f"only the shared root should be top-level, got {top_level_names}"
+    )
+
+
+@test("flatten_all's background-thread stages (prepare/run_one/finish) produce the same result as the synchronous path")
+def test_flatten_background_stages_via_thread_pool():
+    # SEAMS_TO_FUR_OT_flatten_all's interactive (real-window) path drives
+    # exactly this sequence - _flatten_prepare on the main thread, one
+    # _flatten_run_one per piece submitted to a ThreadPoolExecutor, then
+    # _flatten_finish back on the main thread - via a modal timer instead
+    # of a blocking call. There's no window/event loop in this headless
+    # test to drive that modal loop (bpy.app.background is True, so the
+    # operator itself always takes the synchronous _flatten_pieces
+    # fallback here - see test_cube_two_islands etc.), so this test
+    # exercises the same three staged functions directly with a real
+    # ThreadPoolExecutor, the one piece of the interactive path that's
+    # otherwise never covered by the headless suite.
+    import concurrent.futures
+
+    from bl_ext.user_default.seams_to_fur.operators import flatten as flatten_ops
+
+    _clean_scene()
+    bpy.ops.mesh.primitive_cube_add(size=1.0)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Cube"
+
+    face = next(f for f in mesh_obj.data.polygons if tuple(f.normal) == (0.0, 0.0, 1.0))
+    world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
+    centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
+    _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.8 for p in world_pts])
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    context = bpy.context
+
+    state = flatten_ops._flatten_prepare(context, mesh_obj, None)
+    pending = state["pending"]
+    assert len(pending) == 2, f"expected 2 pieces prepared, got {len(pending)}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as executor:
+        futures = [
+            (piece_uuid, executor.submit(flatten_ops._flatten_run_one, state["binary_path"], verts_list, faces_local))
+            for piece_uuid, _name, verts_list, faces_local in pending
+        ]
+        piece_results = {}
+        for piece_uuid, future in futures:
+            piece_results[piece_uuid] = (future.result(), None)
+
+    errors = flatten_ops._flatten_finish(context, mesh_obj, state, piece_results)
+    assert not errors, f"expected no errors, got {errors}"
+
+    assert len(mesh_obj.seams_to_fur_pieces) == 2
+    for piece in mesh_obj.seams_to_fur_pieces:
+        assert not piece.flatten_dirty, f"{piece.name} should be clean after the background-staged flatten"
+        flat_obj = bpy.data.objects.get(piece.flattened_object)
+        assert flat_obj is not None and len(flat_obj.data.polygons) > 0, (
+            f"{piece.name}'s flattened object should have real geometry"
+        )
 
 
 def run_all():

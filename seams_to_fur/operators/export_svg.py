@@ -1,0 +1,73 @@
+import bpy
+from bpy.props import FloatProperty, StringProperty
+from bpy.types import Operator
+from bpy_extras.io_utils import ExportHelper
+
+from ..export import svg as svg_export
+from . import export_common, target
+
+
+class SEAMS_TO_FUR_OT_export_svg(Operator, ExportHelper):
+    """Export all flattened pattern pieces for the active object to an SVG file"""
+
+    bl_idname = "seams_to_fur.export_svg"
+    bl_label = "Export Sewing Pattern (SVG)"
+    bl_options = {"REGISTER"}
+
+    filename_ext = ".svg"
+    filter_glob: StringProperty(default="*.svg", options={"HIDDEN"})
+
+    seam_allowance_mm: FloatProperty(
+        name="Seam Allowance (mm)",
+        description=(
+            "Default seam allowance for pieces that don't have their own set "
+            "(offset_mm == 0). Pieces with their own nonzero seam allowance are "
+            "left exactly as configured - this never overrides them. 0 leaves "
+            "every not-yet-configured piece with no cut line, as before"
+        ),
+        default=0.0,
+        min=0.0,
+        soft_max=25.0,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = target.resolve_mesh_obj(context)
+        return obj is not None and len(obj.seams_to_fur_pieces) > 0
+
+    def execute(self, context):
+        mesh_obj = target.resolve_mesh_obj(context)
+
+        try:
+            mm_scale = export_common.blender_units_to_mm(context)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        override = self.seam_allowance_mm if self.seam_allowance_mm > 0.0 else None
+        pieces = export_common.gather_piece_export_data(
+            context, mesh_obj, mm_scale, seam_allowance_override_mm=override
+        )
+        if not pieces:
+            self.report({"ERROR"}, "No flattened pieces to export - run Flatten All first")
+            return {"CANCELLED"}
+
+        svg_doc = svg_export.build_svg(pieces)
+        with open(self.filepath, "w") as f:
+            f.write(svg_doc)
+
+        self.report({"INFO"}, f"Exported {len(pieces)} piece(s) to {self.filepath}")
+        return {"FINISHED"}
+
+
+_classes = (SEAMS_TO_FUR_OT_export_svg,)
+
+
+def register():
+    for cls in _classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    for cls in reversed(_classes):
+        bpy.utils.unregister_class(cls)

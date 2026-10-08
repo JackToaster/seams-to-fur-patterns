@@ -6,5 +6,5 @@ __pycache__/
 # Machine-specific dev build of the BFF CLI backend (dynamically linked
 # against this machine's system SuiteSparse) - see README for how to build
 # it locally. Not a redistributable binary, so it doesn't belong in git.
-usbee/backends/bin/*/bff-command-line
-usbee/backends/bin/*/bff-command-line.exe
+seams_to_fur/backends/bin/*/bff-command-line
+seams_to_fur/backends/bin/*/bff-command-line.exe

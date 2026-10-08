@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "usbee"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "seams_to_fur"))
 
 from geometry import boundary
 
