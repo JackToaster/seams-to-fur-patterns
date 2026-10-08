@@ -87,6 +87,13 @@ class SeamsToFurPieceSettings(PropertyGroup):
         name="Needs Re-bake",
         default=True,
     )
+    # Fingerprints of this piece's cut island geometry (see
+    # geometry.islands._island_hash): island_hash is the latest one
+    # computed, baked_island_hash the one its flattened object was last
+    # baked from. A differing pair is what marks the piece dirty when
+    # islands are recomputed - not merely the recompute itself.
+    island_hash: StringProperty(options={"HIDDEN"})
+    baked_island_hash: StringProperty(options={"HIDDEN"})
     flattened_object: StringProperty(
         name="Flattened Object",
         description="Name of the flat mesh Object produced by the last bake, if any",

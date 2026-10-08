@@ -402,6 +402,23 @@ def _island_centroid(bm, face_indices):
     return total / len(face_indices)
 
 
+def _island_hash(bm, face_indices):
+    """A fingerprint of one island's cut geometry - its faces and their
+    vertex positions (rounded, so float noise between two identical
+    recomputes can't make them differ). Changes whenever the piece's
+    actual shape would: a seam moving, the source mesh being edited, or a
+    modifier upstream changing its result."""
+    import hashlib
+
+    bm.faces.ensure_lookup_table()
+    digest = hashlib.sha1()
+    for face_idx in sorted(face_indices):
+        for vert in bm.faces[face_idx].verts:
+            digest.update(("%.6f,%.6f,%.6f;" % tuple(vert.co)).encode())
+        digest.update(b"|")
+    return digest.hexdigest()
+
+
 def sync_piece_settings(obj, bm, face_island, island_count):
     """Reconcile obj.seams_to_fur_pieces with the freshly computed islands, keeping
     existing UUIDs (and therefore offset/color/etc settings) for islands
@@ -421,6 +438,7 @@ def sync_piece_settings(obj, bm, face_island, island_count):
     island_centroids = {
         island_id: _island_centroid(bm, faces) for island_id, faces in island_faces.items()
     }
+    island_hashes = {island_id: _island_hash(bm, faces) for island_id, faces in island_faces.items()}
     from mathutils import Vector
 
     prev_points = [(p.uuid, Vector(p.sample_point)) for p in obj.seams_to_fur_pieces if p.uuid]
@@ -467,6 +485,8 @@ def sync_piece_settings(obj, bm, face_island, island_count):
             "flattened_object": p.flattened_object,
             "cut_line_object": p.cut_line_object,
             "error_message": p.error_message,
+            "flatten_dirty": p.flatten_dirty,
+            "baked_island_hash": p.baked_island_hash,
         }
         for p in obj.seams_to_fur_pieces
     }
@@ -513,9 +533,19 @@ def sync_piece_settings(obj, bm, face_island, island_count):
             entry.flattened_object = old["flattened_object"]
             entry.cut_line_object = old["cut_line_object"]
             entry.error_message = old["error_message"]
+            entry.baked_island_hash = old["baked_island_hash"]
         else:
             entry.name = _next_unused_name()
-        entry.flatten_dirty = True
+        entry.island_hash = island_hashes[island_id]
+        # Recomputing islands happens for plenty of reasons that don't
+        # change a piece (a preview or color sync re-runs this whole
+        # pipeline) - only a piece whose actual cut geometry now differs
+        # from what it was last baked from needs re-flattening. A piece
+        # already marked dirty (e.g. by a seam edit) stays dirty until it
+        # is actually re-baked.
+        entry.flatten_dirty = (
+            old is None or old["flatten_dirty"] or entry.baked_island_hash != entry.island_hash
+        )
 
 
 def _chain_edges_into_runs(edges):

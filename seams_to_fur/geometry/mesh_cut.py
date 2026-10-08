@@ -375,15 +375,26 @@ def cut_path_into_mesh(bm, points, merge_dist=MERGE_DIST, vertex_cache=None):
         # in practice does happen and produces a genuine non-manifold
         # edge (confirmed: a real hood mesh had two faces sharing the same
         # 3 vertices with reversed winding right at one of these spots).
-        nearby_faces = {face}
+        #
+        # Ordered (dict.fromkeys, not a set) and closest-wins: a set of
+        # BMesh elements iterates in memory-address order, which differs
+        # from run to run, so when two vertices both sat within tol the
+        # *first one found* was effectively random - the same seams on the
+        # same mesh cut slightly differently on every recompute (confirmed:
+        # vertex counts drifting between otherwise identical runs, which
+        # also made every preview refresh look like a geometry change).
+        nearby_faces = dict.fromkeys([face])
         for e in face.edges:
-            nearby_faces.update(e.link_faces)
+            nearby_faces.update(dict.fromkeys(e.link_faces))
+        best, best_dist = None, None
         for f in nearby_faces:
             for fv in f.verts:
-                if (fv.co - p).length <= tol:
-                    vertex_cache[_vertex_key(p)] = fv
-                    return fv
-        return None
+                dist = (fv.co - p).length
+                if dist <= tol and (best_dist is None or dist < best_dist):
+                    best, best_dist = fv, dist
+        if best is not None:
+            vertex_cache[_vertex_key(p)] = best
+        return best
 
     def get_or_insert(face, p):
         # HINT_MATCH_TOL, not merge_dist: an insertion landing within

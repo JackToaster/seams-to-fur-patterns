@@ -289,6 +289,46 @@ def test_partial_rebake_only_touches_edited_piece():
     )
 
 
+@test("recomputing islands without changing a piece (e.g. a fur preview refresh) leaves it clean; editing the mesh dirties only the affected piece")
+def test_dirty_flag_tracks_actual_geometry_changes():
+    _clean_scene()
+    bpy.ops.mesh.primitive_cube_add(size=1.0)
+    mesh_obj = bpy.context.active_object
+    mesh_obj.name = "Cube"
+
+    face = next(f for f in mesh_obj.data.polygons if tuple(f.normal) == (0.0, 0.0, 1.0))
+    world_pts = [mesh_obj.matrix_world @ mesh_obj.data.vertices[i].co for i in face.vertices]
+    centroid = sum(world_pts, world_pts[0].__class__((0, 0, 0))) / len(world_pts)
+    _add_seam_curve_for(mesh_obj, [centroid + (p - centroid) * 0.8 for p in world_pts])
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    assert bpy.ops.seams_to_fur.flatten_all() == {"FINISHED"}
+    assert not any(p.flatten_dirty for p in mesh_obj.seams_to_fur_pieces), "expected every piece clean right after Flatten All"
+
+    # Refreshing the fur preview re-runs the whole island pipeline, but
+    # nothing about either piece changed - it used to mark every piece as
+    # needing a re-bake anyway (confirmed live, on the bundled example).
+    assert bpy.ops.seams_to_fur.refresh_fur_preview() == {"FINISHED"}
+    dirty = [p.name for p in mesh_obj.seams_to_fur_pieces if p.flatten_dirty]
+    assert not dirty, f"a preview refresh marked unchanged pieces dirty: {dirty}"
+
+    # Reshaping the source mesh away from the seam must still dirty the
+    # piece it actually changed (the bottom/sides), and only that one.
+    small = min(mesh_obj.seams_to_fur_pieces, key=lambda p: len(bpy.data.objects[p.flattened_object].data.polygons))
+    small_name = small.name
+    for v in mesh_obj.data.vertices:
+        if v.co.z < 0:
+            v.co.z -= 0.2
+    mesh_obj.data.update()
+    bpy.context.view_layer.objects.active = mesh_obj
+    assert bpy.ops.seams_to_fur.refresh_fur_preview() == {"FINISHED"}
+    states = {p.name: p.flatten_dirty for p in mesh_obj.seams_to_fur_pieces}
+    assert not states[small_name], f"the untouched top piece was marked dirty: {states}"
+    assert any(dirty for name, dirty in states.items() if name != small_name), (
+        f"editing the mesh didn't mark the reshaped piece dirty: {states}"
+    )
+
+
 @test("open (dart) seam curve stays one piece but duplicates verts along the cut, pinching at the tip")
 def test_open_dart_curve_splits_vertices():
     _clean_scene()

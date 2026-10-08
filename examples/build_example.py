@@ -2,8 +2,9 @@
 
 A small, self-contained demo of the whole pipeline: a stylized plush bee
 body (an elongated sphere) cut into stripes by seams, flattened, given
-per-piece fur colors, fur lengths and grain directions, then exported as a
-LightBurn-ready SVG with a 5mm seam allowance.
+per-piece fur colors, fur lengths and grain directions, previewed with the
+live fur particle preview, then exported as a LightBurn-ready SVG with a
+5mm seam allowance.
 
 Regenerate after changing the add-on (it must be installed and enabled -
 see the README):
@@ -114,7 +115,19 @@ def main():
         piece.grain_direction = (0.0, 0.0, -1.0)
         piece.has_grain_direction = True
 
+    assert bpy.ops.seams_to_fur.refresh_fur_preview() == {"FINISHED"}
+    dirty = [p.name for p in body.seams_to_fur_pieces if p.flatten_dirty]
+    assert not dirty, f"pieces left needing a re-bake after the fur preview: {dirty}"
+    # Open on the fur, not a gray solid-shaded mesh.
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                area.spaces.active.shading.type = "MATERIAL"
+
     assert bpy.ops.seams_to_fur.export_svg(filepath=str(SVG_PATH), seam_allowance_mm=5.0) == {"FINISHED"}
+    # Drop the factory-startup scene's leftovers (the deleted default
+    # cube's mesh, and the material it still references).
+    bpy.data.orphans_purge(do_recursive=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(BLEND_PATH), compress=True)
     print(f"Wrote {BLEND_PATH} and {SVG_PATH} ({len(pieces)} pieces)")
 

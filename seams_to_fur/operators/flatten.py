@@ -399,6 +399,7 @@ def _flatten_finish(context, mesh_obj, state, piece_results):
             errors.append(str(exc))
 
         piece.flatten_dirty = False
+        piece.baked_island_hash = piece.island_hash
 
     state["bm"].free()
     return errors
